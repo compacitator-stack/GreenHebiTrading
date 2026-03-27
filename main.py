@@ -1156,9 +1156,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
 
-if path == "/" or path == "":
-            self._json({"status": "ok"})
-            return
+        if path == "/" or path == "":
+        self._json({"status": "ok"})
+        return
   
 if path == "/health":
             self._json({"status": "ok", "time": now_et().isoformat()})

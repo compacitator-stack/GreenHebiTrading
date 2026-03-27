@@ -22,9 +22,10 @@ Changes from v2 based on Ross Cameron's full training video:
   - All five criteria verified and logged for every scan candidate
 """
 
-import os, sys, json, time, ssl, signal, math
+import os, sys, json, time, ssl, signal, math, threading
 import urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone, timedelta, date
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 try:
     from zoneinfo import ZoneInfo
@@ -1129,6 +1130,149 @@ def cycle():
         S.scanned = False   # prevent re-send
         S.save()
 
+# ── Dashboard HTTP server ─────────────────────────────────────────────────────
+# Runs in a background thread on port 8080.
+# Serves /api/dashboard — a JSON blob with account, positions, orders,
+# recent fills, trades today, and bot status — all fetched server-side
+# so no CORS issue for the browser dashboard.
+# Zeabur will expose this port automatically if you set the service port to 8080.
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
+
+class DashboardHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        pass  # silence default HTTP logging
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._cors()
+        self.end_headers()
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+
+        if path == "/health":
+            self._json({"status": "ok", "time": now_et().isoformat()})
+            return
+
+        if path == "/api/dashboard":
+            self._serve_dashboard()
+            return
+
+        if path == "/api/log":
+            self._serve_log()
+            return
+
+        self.send_response(404)
+        self._cors()
+        self.end_headers()
+
+    def _json(self, data, status=200):
+        body = json.dumps(data, default=str).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_log(self):
+        try:
+            with open(LOG_FILE) as f:
+                lines = f.readlines()[-50:]
+            self._json({"lines": lines})
+        except Exception as e:
+            self._json({"lines": [], "error": str(e)})
+
+    def _serve_dashboard(self):
+        try:
+            # Fetch live data from Alpaca server-side (no CORS problem here)
+            acct      = alp_get("/v2/account") or {}
+            positions = alp_get("/v2/positions") or []
+            orders    = alp_get("/v2/orders?status=open&limit=50") or []
+            fills     = alp_get(
+                "/v2/account/activities?activity_types=FILL&page_size=20") or []
+            portfolio = alp_get(
+                "/v2/account/portfolio/history"
+                "?period=1D&timeframe=5Min&extended_hours=true") or {}
+
+            equity   = float(acct.get("equity", 0))
+            last_eq  = float(acct.get("last_equity", equity))
+            day_pnl  = round(equity - last_eq, 2)
+
+            # Load bot state
+            bot_state = {}
+            try:
+                with open(STATUS_FILE) as f:
+                    bot_state = json.load(f)
+            except Exception:
+                pass
+
+            trades_today = []
+            try:
+                with open(TRADES_FILE) as f:
+                    trades_today = json.load(f)
+            except Exception:
+                pass
+
+            self._json({
+                "ok": True,
+                "fetched_at": now_et().isoformat(),
+                "account": {
+                    "equity":        equity,
+                    "last_equity":   last_eq,
+                    "day_pnl":       day_pnl,
+                    "buying_power":  float(acct.get("buying_power", 0)),
+                    "cash":          float(acct.get("cash", 0)),
+                    "status":        acct.get("status", ""),
+                },
+                "positions":    positions,
+                "orders":       orders,
+                "fills":        fills,
+                "portfolio":    portfolio,
+                "bot": {
+                    "trade_count":   bot_state.get("trade_count", 0),
+                    "pnl":           bot_state.get("pnl", 0),
+                    "cushion_built": bot_state.get("cushion_built", False),
+                    "scanned":       bot_state.get("scanned", False),
+                    "halted":        bot_state.get("halted", False),
+                    "stopped":       bot_state.get("stopped", False),
+                    "b_mode":        bot_state.get("b_mode", False),
+                    "watchlist":     bot_state.get("watchlist", []),
+                    "started":       bot_state.get("started", ""),
+                },
+                "trades_today": trades_today,
+                "config": {
+                    "daily_target":  DAILY_TARGET,
+                    "max_loss":      MAX_LOSS,
+                    "max_trades":    MAX_TRADES,
+                    "risk_pct":      RISK_PCT,
+                    "gap_min":       GAP_MIN,
+                    "rvol_min":      RVOL_MIN,
+                    "float_max":     FLOAT_MAX,
+                },
+            })
+
+        except Exception as e:
+            log("ERROR", f"Dashboard API error: {e}")
+            self._json({"ok": False, "error": str(e)}, status=500)
+
+
+def start_dashboard_server():
+    try:
+        server = HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler)
+        log("INFO", f"Dashboard API listening on port {DASHBOARD_PORT}")
+        log("INFO", f"  Endpoints: /health  /api/dashboard  /api/log")
+        server.serve_forever()
+    except Exception as e:
+        log("ERROR", f"Dashboard server failed to start: {e}")
+
+
 # ── Shutdown ──────────────────────────────────────────────────────────────────
 def _shutdown(sig, _):
     log("INFO", f"Shutdown signal {sig}")
@@ -1139,6 +1283,11 @@ def _shutdown(sig, _):
 def main():
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT,  _shutdown)
+
+    # Start dashboard API server in background thread
+    t = threading.Thread(target=start_dashboard_server, daemon=True)
+    t.start()
+
     startup()
     log("INFO", "Main loop active")
 

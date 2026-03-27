@@ -1136,7 +1136,7 @@ def cycle():
 # recent fills, trades today, and bot status — all fetched server-side
 # so no CORS issue for the browser dashboard.
 # Zeabur will expose this port automatically if you set the service port to 8080.
-DASHBOARD_PORT = int(os.environ.get("PORT") or os.environ.get("DASHBOARD_PORT", "8080"))
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
 
 class DashboardHandler(BaseHTTPRequestHandler):
 
@@ -1156,11 +1156,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
 
-        if path == "/" or path == "":
-        self._json({"status": "ok"})
-        return
-  
-if path == "/health":
+        if path == "/health":
             self._json({"status": "ok", "time": now_et().isoformat()})
             return
 

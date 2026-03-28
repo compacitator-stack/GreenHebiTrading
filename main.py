@@ -40,6 +40,7 @@ ALPACA_SEC   = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 TG_TOKEN     = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT      = os.environ.get("TELEGRAM_CHAT_ID", "")
+SHEETS_URL   = os.environ.get("SHEETS_WEBHOOK_URL", "")  # Google Apps Script webhook
 
 # ── Strategy parameters (all sourced from Ross's exact rules) ─────────────────
 RISK_PCT       = 0.005   # 0.5% equity at risk per trade
@@ -134,6 +135,25 @@ def tg_poll(offset=0, timeout=25):
             return json.loads(r.read().decode()).get("result", [])
     except Exception:
         return []
+
+# ── Google Sheets webhook ────────────────────────────────────────────────────
+def sheets_push(payload):
+    """POST trade/eod/scan data to Google Apps Script webhook. Never crashes bot."""
+    if not SHEETS_URL:
+        return
+    try:
+        payload["bot_version"] = "GreenClaw v3"
+        payload["timestamp"]   = now_et().isoformat()
+        body = json.dumps(payload, default=str).encode()
+        req  = urllib.request.Request(
+            SHEETS_URL, data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        urllib.request.urlopen(req, timeout=10, context=_ssl)
+        log("DEBUG", "Sheets push OK: " + payload.get("type", "?"))
+    except Exception as e:
+        log("DEBUG", "Sheets push failed (non-fatal): " + str(e))
+
 
 # ── Alpaca ────────────────────────────────────────────────────────────────────
 def alp_h():
@@ -516,8 +536,7 @@ def scan_premarket(b_mode=False):
     open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
     is_premarket = now.hour < 9 or (now.hour == 9 and now.minute < 30)
     if is_premarket:
-        # Pre-market: raw vol/prev_vol avoids division-by-near-zero
-        mins_traded = None
+        mins_traded = None  # use raw vol/prev_vol ratio pre-market
     else:
         mins_traded = max(1, int((now - open_time).total_seconds() / 60))
 
@@ -549,8 +568,7 @@ def scan_premarket(b_mode=False):
 
             # Time-of-day adjusted RVOL (Ross's actual definition)
             if mins_traded is None:
-                # Pre-market: raw ratio vs prior full day
-                tod_rvol = vol / max(prev_vol, 1)
+                tod_rvol = vol / max(prev_vol, 1)  # raw pre-mkt ratio
             else:
                 tod_rvol = calc_tod_rvol(vol, prev_vol, mins_traded)
             # Also compute raw RVOL for display
@@ -561,10 +579,10 @@ def scan_premarket(b_mode=False):
             if price < PRICE_LO:     fails.append(f"price ${price:.2f}<${PRICE_LO}")
             if price > PRICE_HI:     fails.append(f"price ${price:.2f}>${PRICE_HI}")
             if gap < gap_thr:        fails.append(f"gap {gap:.1f}%<{gap_thr}%")
-            # Pre-market raw RVOL of 0.5x ≈ 5x intraday — scale threshold
+            # pre-mkt raw 0.5x ~ intraday 5x — scale threshold down
             effective_rvol_thr = rvol_thr / 10.0 if mins_traded is None else rvol_thr
             if tod_rvol < effective_rvol_thr:
-                fails.append(f"rvol {tod_rvol:.2f}x<{effective_rvol_thr:.2f}x")
+                fails.append("rvol " + str(round(tod_rvol,2)) + "x<" + str(round(effective_rvol_thr,2)) + "x")
 
             if fails:
                 log("DEBUG", f"  SKIP {sym}: {' | '.join(fails)}")
@@ -838,6 +856,7 @@ def handle_cmd(text, cid):
             "/stop      — halt all trading\n"
             "/resume    — resume after stop or halt\n"
             "/cancel    — cancel open orders\n"
+            "/report    — daily summary (trades + watchlist)\n"
             "/bmode     — toggle B-mode (looser criteria)\n"
             "/help      — this message\n\n"
             f"*A-quality*: gap≥{GAP_MIN}% rvol≥{RVOL_MIN}x "
@@ -846,6 +865,54 @@ def handle_cmd(text, cid):
             f"(${DAILY_TARGET*CUSHION_PCT:.0f}), then full\n"
             f"*Daily goal*: ${DAILY_TARGET:.0f} | "
             f"*Max loss*: ${abs(MAX_LOSS):.0f}")
+
+    elif cmd == "/report":
+        try:
+            with open(STATUS_FILE) as f:
+                d = json.load(f)
+        except Exception:
+            d = {}
+        trades  = S.trades_today or []
+        wl      = d.get("watchlist", [])
+        pnl     = d.get("pnl", 0.0)
+        eq      = d.get("equity", 0.0)
+        outcome = "Green" if pnl > 0 else ("Red" if pnl < 0 else "Flat")
+        # Trade lines
+        if trades:
+            tl = []
+            for tr in trades:
+                tl.append("  " + tr["symbol"]
+                          + " " + str(tr["qty"]) + "sh"
+                          + " @ $" + str(tr["entry"])
+                          + " TP $" + str(tr["target"])
+                          + " SL $" + str(tr["stop"])
+                          + " RR " + str(tr["rr"])
+                          + " " + tr.get("target_type", "?"))
+            tlines = "\n".join(tl)
+        else:
+            tlines = "  No trades today"
+        # Watchlist lines
+        if wl:
+            wl_list = []
+            for w in wl:
+                wl_list.append("  " + w["symbol"]
+                               + " $" + str(w["price"])
+                               + " gap " + str(w["gap"]) + "%"
+                               + " rvol " + str(w["rvol"]) + "x"
+                               + " float " + w.get("float_str", "?"))
+            wlines = "\n".join(wl_list)
+        else:
+            wlines = "  No candidates"
+        msg = ("*Daily Report — " + now_et().strftime("%a %b %d") + "*\n"
+               + "Result: " + outcome
+               + " | P&L: $" + f"{pnl:+.2f}" + "\n"
+               + "Equity: $" + f"{eq:,.2f}" + "\n"
+               + "Trades: " + str(len(trades)) + "/" + str(MAX_TRADES) + "\n"
+               + "Cushion: " + ("built" if d.get("cushion_built") else "not yet") + "\n"
+               + "\nWatchlist (" + str(len(wl)) + "):\n" + wlines + "\n"
+               + "\nTrades:\n" + tlines + "\n"
+               + "\n_/logs for full audit trail_")
+        tg_send(msg)
 
     else:
         log("DEBUG", f"Unknown command: {cmd}")
@@ -908,13 +975,21 @@ def cycle():
         S.last_heartbeat = now_ts
 
     # ── Pre-market scan at 9:00–9:05 ET (or forced) ──────────────────────────
-    # Shifted to 9:15 — Polygon volume data unreliable at exactly 9:00
+    # Shifted to 9:15 — Polygon volume not yet populated at exactly 9:00
     scan_time = is_wd and hh == 9 and mm >= 15 and mm < 20
     if (scan_time and not S.scanned) or S.force_scan:
         S.watchlist  = scan_premarket(b_mode=S.b_mode)
         S.scanned    = True
         S.force_scan = False
         S.equity     = get_equity()
+        sheets_push({
+            "type":       "scan",
+            "date":       now_et().strftime("%Y-%m-%d"),
+            "candidates": len(S.watchlist),
+            "watchlist":  S.watchlist,
+            "b_mode":     S.b_mode,
+            "equity":     S.equity,
+        })
 
         if S.watchlist:
             # Fetch pre-market highs for all candidates
@@ -1103,6 +1178,30 @@ def cycle():
                     "catalyst":       w.get("catalyst"),
                     "b_mode":         S.b_mode,
                 })
+                # Push to Google Sheets
+                sheets_push({
+                    "type":       "trade",
+                    "date":       now_et().strftime("%Y-%m-%d"),
+                    "symbol":     sym,
+                    "qty":        qty,
+                    "entry":      sig["entry"],
+                    "stop":       sig["stop"],
+                    "target":     sig["target"],
+                    "target_type":target_type,
+                    "rr":         sig["rr"],
+                    "risk":       sig["risk"],
+                    "total_risk": round(qty * sig["risk"], 2),
+                    "size_label": size_label,
+                    "vwap":       sig["vwap"],
+                    "hod":        sig["hod"],
+                    "pole_height":sig["pole_height"],
+                    "float":      w.get("float_str"),
+                    "catalyst":   w.get("catalyst"),
+                    "b_mode":     S.b_mode,
+                    "equity":     S.equity,
+                    "trade_num":  S.trade_count,
+                    "order_id":   r["id"],
+                })
                 S.save()
                 log("INFO", f"  [{sym}] Trade #{S.trade_count} recorded "
                             f"| size={size_label}")
@@ -1137,6 +1236,19 @@ def cycle():
 
         log("INFO", f"EOD | trades={S.trade_count} pnl=${S.pnl:+.2f} "
                     f"equity=${S.equity:,.2f}")
+        sheets_push({
+            "type":          "eod",
+            "date":          t.strftime("%Y-%m-%d"),
+            "day_name":      t.strftime("%A"),
+            "trades":        S.trade_count,
+            "pnl":           S.pnl,
+            "equity":        S.equity,
+            "last_equity":   last_eq,
+            "candidates":    len(S.watchlist),
+            "outcome":       outcome,
+            "b_mode":        S.b_mode,
+            "trades_detail": S.trades_today,
+        })
         S.scanned = False   # prevent re-send
         S.save()
 

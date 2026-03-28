@@ -41,7 +41,6 @@ ALPACA_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.marke
 TG_TOKEN     = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT      = os.environ.get("TELEGRAM_CHAT_ID", "")
 SHEETS_URL   = os.environ.get("SHEETS_WEBHOOK_URL", "")  # Google Apps Script webhook
-DASH_TOKEN   = os.environ.get("DASHBOARD_TOKEN", "")     # protects /api/dashboard & /api/log
 
 # ── Strategy parameters (all sourced from Ross's exact rules) ─────────────────
 RISK_PCT       = 0.005   # 0.5% equity at risk per trade
@@ -1286,13 +1285,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self._json({"status": "ok", "time": now_et().isoformat()})
             return
-
-        # Token check for sensitive endpoints
-        if path in ("/api/dashboard", "/api/log"):
-            provided = self.path.split("token=")[-1].split("&")[0] if "token=" in self.path else ""
-            if DASH_TOKEN and provided != DASH_TOKEN:
-                self._json({"error": "unauthorized"}, status=401)
-                return
 
         if path == "/api/dashboard":
             self._serve_dashboard()

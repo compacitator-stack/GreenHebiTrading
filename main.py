@@ -26,14 +26,18 @@ Changes from v2 based on Ross Cameron's full training video:
 
 Extended Hours (EXTENDED_HOURS=true):
   - Experimental, togglable via env var or /extended Telegram command
-  - Early scan at 8:00 AM ET builds watchlist sooner (no pre-market trades)
+  - Premarket watchlist scan starts at 7:00 AM ET (always, even if EH off)
+  - Re-scans every 15 min, merging new candidates (never overwrites)
+  - Early session trading 8:00–9:14 ET with premarket bars
   - Late session trading 11:01–15:30 ET with same bull flag criteria
   - Uses standalone limit orders (bracket orders incompatible with EH)
   - Software-based stop-loss: bot polls price and sells via limit order
   - Half position size (EH_SIZE_MULT=0.50)
   - Max 1 EH trade per day (EH_MAX_TRADES=1)
   - Shared daily loss limit and max trades counter with core window
+  - Cold market halt only affects core window, not EH sessions
   - Session tagging in Sheets: core / early / late for win-rate analysis
+  - EOD forced liquidation at 15:55 for any open EH positions
 """
 
 import os, sys, json, time, ssl, signal, math, threading
@@ -65,11 +69,13 @@ EXTENDED_HOURS = os.environ.get("EXTENDED_HOURS", "").lower() in ("1","true","ye
 # Alpaca stops do NOT fire in extended hours — bot polls and sells via limit.
 EH_MAX_TRADES   = 1          # max extended-hours trades per day
 EH_SIZE_MULT    = 0.50       # half position size for EH trades
-EH_EARLY_START  = (8, 0)     # 8:00 AM ET — early scan to build watchlist sooner
-EH_EARLY_END    = (9, 14)    # 9:14 AM ET — core scan takes over at 9:15
+EH_EARLY_START  = (8, 0)     # 8:00 AM ET — EH early trading window opens
+EH_EARLY_END    = (9, 14)    # 9:14 AM ET — core takes over at 9:15
 EH_LATE_START   = (11, 1)    # 11:01 AM ET — core window ends at 11:00
 EH_LATE_END     = (15, 30)   # 3:30 PM ET — stop 30 min before close
 EH_STOP_POLL_SEC = 15        # poll price every N seconds for software stop
+PM_SCAN_START   = (7, 0)     # 7:00 AM ET — first premarket scan (always runs)
+PM_SCAN_INTERVAL = 15        # re-scan every 15 min during premarket
 
 # ── Strategy parameters (all sourced from Ross's exact rules) ─────────────────
 RISK_PCT       = 0.005   # 0.5% equity at risk per trade
@@ -717,6 +723,7 @@ def detect_flag(sym, premarket_high=None, session="core"):
 
     session parameter controls which bars are eligible:
       "core"  — 9:35–11:00 ET (default, original behavior)
+      "early" — 8:00–9:14 ET (premarket, extended hours)
       "late"  — 9:35–15:30 ET (extended hours afternoon)
 
     Returns signal dict or None. Logs reason for every rejection.
@@ -730,23 +737,32 @@ def detect_flag(sym, premarket_high=None, session="core"):
     today_str = now_et().date().isoformat()
     bars = [b for b in bars if b["t"][:10] == today_str]
 
-    # Determine the end-of-window cutoff based on session
-    if session == "late":
-        # Extended hours: accept bars from 9:35 through 15:30 ET
+    # Determine the bar window based on session
+    if session == "early":
+        # Premarket: accept bars from 8:00 through 9:14 ET
+        start_hour, start_min = EH_EARLY_START  # (8, 0)
+        end_hour, end_min = EH_EARLY_END        # (9, 14)
+    elif session == "late":
+        # Extended hours afternoon: accept bars from 9:35 through 15:30 ET
+        start_hour, start_min = 9, 35
         end_hour, end_min = EH_LATE_END  # (15, 30)
     else:
         # Core window: 9:35–11:00 ET (original behavior)
+        start_hour, start_min = 9, 35
         end_hour, end_min = 11, 0
 
-    # Only use bars from 9:35 ET onward (skip opening 5-min chaos)
-    # but still compute VWAP from 9:30 if available
+    # Collect bars for VWAP computation and pattern detection
+    # all_today: all bars from 9:30+ (for VWAP) or 8:00+ (for early session)
+    # market_bars: only bars within the active session window
     all_today = []
     market_bars = []
+    vwap_start_hour = start_hour if session == "early" else 9
+    vwap_start_min  = start_min  if session == "early" else 30
     for b in bars:
         ts_et = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET)
-        if ts_et.hour > 9 or (ts_et.hour == 9 and ts_et.minute >= 30):
+        if ts_et.hour > vwap_start_hour or (ts_et.hour == vwap_start_hour and ts_et.minute >= vwap_start_min):
             all_today.append(b)
-        if ts_et.hour > 9 or (ts_et.hour == 9 and ts_et.minute >= 35):
+        if ts_et.hour > start_hour or (ts_et.hour == start_hour and ts_et.minute >= start_min):
             if ts_et.hour < end_hour or (ts_et.hour == end_hour and ts_et.minute <= end_min):
                 market_bars.append(b)
 
@@ -1052,6 +1068,26 @@ def scan_premarket(b_mode=False):
     log("INFO", f"=== SCAN DONE: {len(results)} candidates ===")
     return results
 
+def merge_scan_results(fresh, label="scan"):
+    """
+    Merge new scan results into S.watchlist without dropping existing candidates.
+    Also fetches pre-market highs for any new symbols.
+    Returns list of newly added candidates (not already in watchlist or traded).
+    """
+    existing_syms = {w["symbol"] for w in S.watchlist}
+    all_traded = S.traded_today | S.eh_traded_today
+    new_found = [w for w in fresh if w["symbol"] not in existing_syms
+                 and w["symbol"] not in all_traded]
+    if new_found:
+        S.watchlist.extend(new_found)
+        for w in new_found:
+            pmh = get_premarket_high(w["symbol"])
+            if pmh:
+                S.premarket_highs[w["symbol"]] = pmh
+        log("INFO", f"  {label}: {len(new_found)} new candidate(s) added: "
+                    f"{[w['symbol'] for w in new_found]}")
+    return new_found
+
 # ── State ─────────────────────────────────────────────────────────────────────
 class State:
     def __init__(self):
@@ -1064,6 +1100,7 @@ class State:
         self.scanned          = False
         self.halted           = False  # loss-limit auto-halt
         self.stopped          = False  # manual /stop
+        self.core_cold_halted = False  # cold market halt (core window only)
         self.b_mode           = False
         self.cushion_built    = False  # True once 25% of daily target earned
         self.last_trade_time  = None   # datetime of last trade attempt
@@ -1080,7 +1117,7 @@ class State:
         self.eh_traded_today    = set()    # symbols traded in EH
         self.eh_trades_today    = []       # EH trade detail dicts
         self.eh_active_stops    = {}       # order_id -> stop info for software stops
-        self.eh_early_scanned   = False    # did the 8:00 AM early scan run?
+        self.pm_last_scan       = 0.0      # unix ts of last premarket scan (7:00+ AM)
         self.eh_last_late_scan  = 0.0      # unix ts of last late-session re-scan
 
     def new_day(self, d):
@@ -1094,6 +1131,7 @@ class State:
         self.scanned         = False
         self.halted          = False
         self.stopped         = False   # reset cold-market / manual stop
+        self.core_cold_halted = False  # reset cold market core halt
         self.b_mode          = False   # reset B-mode for fresh day
         self.cushion_built   = False
         self.last_trade_time = None
@@ -1106,7 +1144,7 @@ class State:
         self.eh_traded_today    = set()
         self.eh_trades_today    = []
         self.eh_active_stops    = {}
-        self.eh_early_scanned   = False
+        self.pm_last_scan       = 0.0
         self.eh_last_late_scan  = 0.0
 
     def save(self):
@@ -1164,6 +1202,7 @@ def handle_cmd(text, cid):
             f"B-mode:  {d.get('b_mode',False)}\n"
             f"Halted:  {d.get('halted',False)}\n"
             f"Stopped: {d.get('stopped',False)}\n"
+            f"Core cold halt: {S.core_cold_halted}\n"
             f"Dry-run: {'🔵 ON' if DRY_RUN else '🟢 OFF'}\n"
             f"Extended hours: {'🌙 ON' if EXTENDED_HOURS else '⚪ OFF'}"
             + (f"\n  EH trades: {S.eh_trade_count}/{EH_MAX_TRADES}"
@@ -1224,6 +1263,7 @@ def handle_cmd(text, cid):
     elif cmd == "/resume":
         S.stopped = False
         S.halted  = False
+        S.core_cold_halted = False
         S.save()
         tg_send("▶ *Trading RESUMED*")
 
@@ -1248,7 +1288,9 @@ def handle_cmd(text, cid):
         st = "ENABLED" if _eh else "DISABLED"
         log("INFO", f"Extended hours {st} via Telegram command")
         tg_send(f"🌙 *Extended Hours {st}*\n"
-                + (f"Late session: {EH_LATE_START[0]}:{EH_LATE_START[1]:02d}–"
+                + (f"Early session: {EH_EARLY_START[0]}:{EH_EARLY_START[1]:02d}–"
+                   f"{EH_EARLY_END[0]}:{EH_EARLY_END[1]:02d} ET\n"
+                   f"Late session: {EH_LATE_START[0]}:{EH_LATE_START[1]:02d}–"
                    f"{EH_LATE_END[0]}:{EH_LATE_END[1]:02d} ET\n"
                    f"Max EH trades: {EH_MAX_TRADES}/day\n"
                    f"Position size: {EH_SIZE_MULT:.0%} of normal\n"
@@ -1446,12 +1488,24 @@ def cycle():
                     f"equity ${S.equity:,.2f}")
         S.last_heartbeat = now_ts
 
-    # ── Pre-market scan at 9:00–9:05 ET (or forced) ──────────────────────────
-    # Shifted to 9:15 — Polygon volume not yet populated at exactly 9:00
+    # ── Core scan at 9:15 ET (or forced) ────────────────────────────────────
+    # Merges new candidates into existing watchlist (premarket scan may have
+    # already built one). Never overwrites — only adds new symbols.
     scan_time = is_wd and hh == 9 and mm >= 15 and mm < 20
     if (scan_time and not S.scanned) or S.force_scan:
         is_forced = S.force_scan   # remember if this was a manual /scan
-        S.watchlist  = scan_premarket(b_mode=S.b_mode)
+        fresh = scan_premarket(b_mode=S.b_mode)
+
+        # Merge instead of overwrite — premarket watchlist is preserved
+        if not S.watchlist:
+            S.watchlist = fresh
+            for w in S.watchlist:
+                pmh = get_premarket_high(w["symbol"])
+                if pmh:
+                    S.premarket_highs[w["symbol"]] = pmh
+        else:
+            merge_scan_results(fresh, label="Core 9:15")
+
         S.scanned    = True
         S.force_scan = False
         S.equity     = get_equity()
@@ -1467,9 +1521,10 @@ def cycle():
         # ── Key fix: if a manual /scan finds candidates, un-halt the bot ──
         # This is what should have happened today with ELAB/ASTC/EEIQ/QNTM/KZR
         if S.watchlist and is_forced:
-            if S.stopped or S.halted:
+            if S.stopped or S.halted or S.core_cold_halted:
                 S.stopped = False
                 S.halted  = False
+                S.core_cold_halted = False
                 log("INFO", f"Manual scan found {len(S.watchlist)} candidate(s) "
                             f"— resuming from halt/stop")
                 tg_send(f"▶ *Resumed* — manual scan found "
@@ -1573,8 +1628,9 @@ def cycle():
                 + f"\nTotal watchlist: {len(S.watchlist)}")
 
             # If bot was halted by cold-market logic, resume it
-            if S.stopped:
+            if S.stopped or S.core_cold_halted:
                 S.stopped = False
+                S.core_cold_halted = False
                 log("INFO", "Intraday scan found candidates — resuming from cold-market halt")
                 tg_send("▶ *Resumed* — intraday scan found new candidates")
 
@@ -1595,14 +1651,17 @@ def cycle():
             log("DEBUG", f"Intraday re-scan: no new candidates "
                          f"(total scanned: {len(fresh)})")
 
-    # ── Cold market auto-stop ─────────────────────────────────────────────────
+    # ── Cold market auto-stop (CORE WINDOW ONLY) ────────────────────────────
     # Ross: "if I haven't picked up a trade in 30 minutes I just give up"
     # Note: we use last_trade_time as the reset anchor — intraday scans that
     # find new candidates reset this timer, giving a fresh 30-min window.
+    # IMPORTANT: this only sets S.core_cold_halted, NOT S.stopped.
+    # Extended hours sessions are not affected by the cold market rule —
+    # the whole point of EH mode is to find setups on cold days.
     if (is_wd and hh >= 9 and hh < 11
             and S.scanned
             and S.trade_count == 0
-            and not S.stopped and not S.halted):
+            and not S.core_cold_halted and not S.stopped and not S.halted):
         # Anchor: either last reset time or 9:35 ET open
         first_monitor = t.replace(hour=9, minute=35, second=0, microsecond=0)
         anchor = S.last_trade_time if S.last_trade_time else (
@@ -1610,11 +1669,13 @@ def cycle():
         if anchor and t > first_monitor:
             elapsed = (t - anchor).total_seconds() / 60
             if elapsed >= NO_TRADE_HALT_MINS:
-                S.stopped = True
-                log("INFO", "Cold market: no setup in 30 min — stopping")
-                tg_send(f"🥶 *Cold market — stopping for today*\n"
+                S.core_cold_halted = True
+                log("INFO", "Cold market: no setup in 30 min — core window stopping")
+                tg_send(f"🥶 *Cold market — core window stopped*\n"
                         f"No valid setup found in {NO_TRADE_HALT_MINS} min.\n"
-                        f"Send /resume to override if you see something.")
+                        + (f"Extended hours will continue scanning.\n"
+                           if EXTENDED_HOURS else "")
+                        + f"Send /resume to override.")
                 S.save()
 
     # ── Active trading: 9:35–11:00 ET ────────────────────────────────────────
@@ -1622,7 +1683,7 @@ def cycle():
                  ((hh == 9 and mm >= 35) or hh == 10
                   or (hh == 11 and mm == 0)))
 
-    if in_window and S.watchlist and not S.halted and not S.stopped:
+    if in_window and S.watchlist and not S.halted and not S.stopped and not S.core_cold_halted:
 
         # ── Refresh live P&L from Alpaca each cycle ──────────────────────
         # Without this, S.pnl stays 0.0 all session and cushion never
@@ -1790,47 +1851,195 @@ def cycle():
             S.be_moved.update(newly_moved)
             S.save()
 
-    # ── Extended Hours: Early scan at 8:00 AM ET ─────────────────────────────
-    # Builds watchlist earlier so bot is ready when market opens.
-    # Does NOT place trades pre-market (no reliable 1-min bars from IEX).
-    if (EXTENDED_HOURS and is_wd
-            and hh == EH_EARLY_START[0] and mm >= EH_EARLY_START[1] and mm < EH_EARLY_START[1] + 5
-            and not S.eh_early_scanned and not S.scanned):
-        log("INFO", "EH: Early pre-market scan at 8:00 ET")
-        S.watchlist = scan_premarket(b_mode=S.b_mode)
-        S.eh_early_scanned = True
-        S.equity = get_equity()
-        if S.watchlist:
+    # ── Premarket continuous scan (7:00 AM+ every 15 min) ───────────────────
+    # ALWAYS runs (not gated on EXTENDED_HOURS) — earlier watchlist is better
+    # for everyone. Merges new candidates into watchlist (never overwrites).
+    # Fetches PMH for each new candidate automatically.
+    pm_scan_window = (is_wd
+                      and ((hh == PM_SCAN_START[0] and mm >= PM_SCAN_START[1])
+                           or (hh > PM_SCAN_START[0] and hh < 9)
+                           or (hh == 9 and mm < 15)))  # stop at 9:15 when core scan takes over
+
+    if (pm_scan_window
+            and (now_ts - S.pm_last_scan) >= PM_SCAN_INTERVAL * 60):
+        S.pm_last_scan = now_ts
+        scan_label = f"PM {t.strftime('%H:%M ET')}"
+        log("INFO", f"Premarket scan at {t.strftime('%H:%M ET')}...")
+        fresh = scan_premarket(b_mode=S.b_mode)
+
+        if not S.watchlist:
+            # First scan of the day — set watchlist directly
+            S.watchlist = fresh
             for w in S.watchlist:
                 pmh = get_premarket_high(w["symbol"])
                 if pmh:
                     S.premarket_highs[w["symbol"]] = pmh
-            lines = []
-            for w in S.watchlist:
+            new_found = fresh
+        else:
+            # Subsequent scans — merge new candidates
+            new_found = merge_scan_results(fresh, label=scan_label)
+
+        S.equity = get_equity()
+
+        if new_found:
+            lines_out = []
+            for w in new_found:
                 pmh = S.premarket_highs.get(w["symbol"])
-                lines.append(
+                lines_out.append(
                     f"  *{w['symbol']}* ${w['price']:.2f} | "
                     f"gap {w['gap']}% | rvol {w['rvol']}x | "
                     f"float {w.get('float_str','?')}"
                     + (f" | PMH ${pmh:.2f}" if pmh else "") + "\n"
                     f"    {'📰' if w.get('has_news') else '⚠️'} "
                     f"{w.get('catalyst','')[:60]}")
+            is_first = (S.pm_last_scan == now_ts and len(S.watchlist) == len(new_found))
             tg_send(
-                f"🌅 *EH EARLY SCAN (8:00 ET)*\n"
-                + "\n".join(lines)
-                + f"\n\nWatchlist built early. Core scan at 9:15 will refresh.\n"
-                f"Equity: ${S.equity:,.2f}")
-        else:
-            tg_send(f"🌅 *EH EARLY SCAN — No candidates yet*\n"
-                    f"Will re-check at 9:15 ET core scan")
+                f"🌅 *PREMARKET SCAN ({t.strftime('%H:%M ET')})*\n"
+                + "\n".join(lines_out)
+                + (f"\nTotal watchlist: {len(S.watchlist)}" if not is_first else "")
+                + f"\nEquity: ${S.equity:,.2f}")
+        elif S.pm_last_scan == now_ts and not S.watchlist:
+            # First scan found nothing — notify once
+            tg_send(f"🌅 *PREMARKET SCAN — No candidates yet*\n"
+                    f"Re-scanning every {PM_SCAN_INTERVAL}min until 9:15 ET")
+
         sheets_push({
-            "type": "scan", "session": "early",
+            "type": "scan", "session": "premarket",
             "date": now_et().strftime("%Y-%m-%d"),
-            "candidates": len(S.watchlist),
-            "watchlist": S.watchlist,
+            "time": t.strftime("%H:%M ET"),
+            "candidates": len(fresh),
+            "new_found": len(new_found) if new_found else 0,
+            "watchlist_total": len(S.watchlist),
             "b_mode": S.b_mode, "equity": S.equity,
         })
         S.save()
+
+    # ── Extended Hours: Early session trading (8:00–9:14 ET) ─────────────────
+    # Uses premarket bars from IEX/Alpaca for bull flag detection.
+    # Same criteria, half size, software stops, max 1 EH trade/day.
+    eh_early_window = (EXTENDED_HOURS and is_wd
+                       and ((hh == EH_EARLY_START[0] and mm >= EH_EARLY_START[1])
+                            or (hh > EH_EARLY_START[0] and hh < EH_EARLY_END[0])
+                            or (hh == EH_EARLY_END[0] and mm <= EH_EARLY_END[1])))
+
+    if (eh_early_window
+            and S.watchlist
+            and not S.halted and not S.stopped
+            and S.eh_trade_count < EH_MAX_TRADES
+            and S.trade_count < MAX_TRADES):
+
+        # Refresh live P&L
+        live_pnl, live_eq = get_live_pnl()
+        if live_pnl is not None:
+            S.pnl    = live_pnl
+            S.equity = live_eq
+
+        # Daily loss limit (shared)
+        if S.pnl <= MAX_LOSS:
+            S.halted = True
+            tg_send(f"🛑 *DAILY LOSS LIMIT HIT (during EH early)*\n"
+                    f"P&L: ${S.pnl:+.2f} | Limit: ${MAX_LOSS:.0f}\n"
+                    f"All trading halted.")
+            S.save()
+        else:
+            positions = get_positions()
+            held_syms = {p.get("symbol", "") for p in (positions or [])}
+            all_traded = S.traded_today | S.eh_traded_today
+
+            for w in S.watchlist:
+                sym = w["symbol"]
+                if sym in all_traded or sym in held_syms:
+                    continue
+                if S.eh_trade_count >= EH_MAX_TRADES:
+                    break
+                if S.trade_count >= MAX_TRADES:
+                    break
+
+                pmh = S.premarket_highs.get(sym)
+                sig = detect_flag(sym, premarket_high=pmh, session="early")
+                if not sig:
+                    continue
+
+                # Half position sizing for EH trades
+                effective_equity = S.equity
+                risk_dollars = effective_equity * RISK_PCT * EH_SIZE_MULT
+                if not S.cushion_built:
+                    risk_dollars *= 0.25
+                    size_label = f"EH quarter (building cushion, {EH_SIZE_MULT:.0%}x)"
+                elif S.pnl >= DAILY_TARGET:
+                    risk_dollars *= 0.50
+                    size_label = f"EH half (protecting gains, {EH_SIZE_MULT:.0%}x)"
+                else:
+                    size_label = f"EH half ({EH_SIZE_MULT:.0%}x base)"
+
+                qty = int(risk_dollars / sig["risk"]) if sig["risk"] > 0 else 0
+                max_qty = int(effective_equity * 0.25 / sig["entry"])
+                qty = min(qty, max_qty)
+                qty = max(qty, 1)
+
+                target_type = "HOD retest" if sig.get("target_is_hod") else "measured move"
+
+                tg_send(
+                    f"🌅 *EH BULL FLAG: {sym}*\n"
+                    f"Session: EARLY ({t.strftime('%H:%M ET')})\n"
+                    f"Entry:  ${sig['entry']:.2f}\n"
+                    f"Stop:   ${sig['stop']:.2f}  (⚠️ SOFTWARE stop)\n"
+                    f"Target: ${sig['target']:.2f}  ({target_type})\n"
+                    f"R:R:    {sig['rr']}:1\n"
+                    f"Shares: {qty}  | Size: {size_label}\n"
+                    f"Total risk: ${qty * sig['risk']:.0f}\n"
+                    f"─────────────────\n"
+                    f"Pattern: {sig['total_candles']} candles\n"
+                    f"⚠️ Premarket — no broker-side stop")
+
+                r = place_eh_order(sym, qty, sig["entry"], sig["stop"], sig["target"])
+
+                if r and r.get("id"):
+                    S.eh_traded_today.add(sym)
+                    S.eh_trade_count += 1
+                    S.trade_count += 1
+                    S.last_trade_time = now_et()
+
+                    trade_record = {
+                        "symbol": sym, "qty": qty,
+                        "entry": sig["entry"], "stop": sig["stop"],
+                        "breakeven_stop": sig["breakeven_stop"],
+                        "target": sig["target"], "target_type": target_type,
+                        "rr": sig["rr"], "risk": sig["risk"],
+                        "order_id": r["id"], "size_label": size_label,
+                        "session": "early",
+                        "time": now_et().strftime("%H:%M ET"),
+                        "vwap": sig["vwap"], "hod": sig["hod"],
+                        "pole_height": sig["pole_height"],
+                        "float": w.get("float_str"),
+                        "catalyst": w.get("catalyst"),
+                        "b_mode": S.b_mode,
+                        "dry_run": r.get("dry_run", False),
+                        "eh_order": True,
+                    }
+                    S.eh_trades_today.append(trade_record)
+                    S.trades_today.append(trade_record)
+
+                    sheets_push({
+                        "type": "trade", "session": "early",
+                        "date": now_et().strftime("%Y-%m-%d"),
+                        "symbol": sym, "qty": qty,
+                        "entry": sig["entry"], "stop": sig["stop"],
+                        "target": sig["target"], "target_type": target_type,
+                        "rr": sig["rr"], "risk": sig["risk"],
+                        "total_risk": round(qty * sig["risk"], 2),
+                        "size_label": size_label,
+                        "vwap": sig["vwap"], "hod": sig["hod"],
+                        "float": w.get("float_str"),
+                        "catalyst": w.get("catalyst"),
+                        "b_mode": S.b_mode, "equity": S.equity,
+                        "trade_num": S.trade_count,
+                        "order_id": r["id"], "eh_order": True,
+                    })
+                    S.save()
+                    log("INFO", f"  [{sym}] EH Early Trade #{S.eh_trade_count} "
+                                f"| size={size_label}")
+                    break  # max 1 per cycle
 
     # ── Extended Hours: Late session trading (11:01–15:30 ET) ─────────────────
     # Same bull flag criteria, but with expanded bar window and EH order flow.
@@ -1866,18 +2075,8 @@ def cycle():
                 S.eh_last_late_scan = now_ts
                 log("INFO", f"EH: Late session re-scan at {t.strftime('%H:%M ET')}...")
                 fresh = scan_premarket(b_mode=S.b_mode)
-                existing_syms = {w["symbol"] for w in S.watchlist}
-                all_traded = S.traded_today | S.eh_traded_today
-                new_found = [w for w in fresh if w["symbol"] not in existing_syms
-                             and w["symbol"] not in all_traded]
+                new_found = merge_scan_results(fresh, label=f"EH Late {t.strftime('%H:%M')}")
                 if new_found:
-                    S.watchlist.extend(new_found)
-                    for w in new_found:
-                        pmh = get_premarket_high(w["symbol"])
-                        if pmh:
-                            S.premarket_highs[w["symbol"]] = pmh
-                    log("INFO", f"  EH late scan: {len(new_found)} new candidate(s): "
-                                f"{[w['symbol'] for w in new_found]}")
                     lines_out = []
                     for w in new_found:
                         pmh = S.premarket_highs.get(w["symbol"])

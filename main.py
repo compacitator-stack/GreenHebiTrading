@@ -120,6 +120,7 @@ def http(method, url, data=None, headers=None, timeout=15):
 
 def GET(url, h=None):       return http("GET",    url, headers=h)
 def POST(url, d, h=None):   return http("POST",   url, d, h)
+def PATCH(url, d, h=None):  return http("PATCH",  url, d, h)
 def DELETE(url, h=None):    return http("DELETE", url, headers=h)
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -168,12 +169,127 @@ def alp_h():
 
 def alp_get(p):    return GET(f"{ALPACA_URL}{p}", h=alp_h())
 def alp_post(p,d): return POST(f"{ALPACA_URL}{p}", d, h=alp_h())
+def alp_patch(p,d):return PATCH(f"{ALPACA_URL}{p}", d, h=alp_h())
 def alp_del(p):    return DELETE(f"{ALPACA_URL}{p}", h=alp_h())
 
 def get_account():   return alp_get("/v2/account") or {}
 def get_equity():    return float(get_account().get("equity", 0))
 def get_positions(): return alp_get("/v2/positions") or []
 def get_orders():    return alp_get("/v2/orders?status=open&limit=50") or []
+
+def get_live_pnl():
+    """
+    Fetch real-time intraday P&L from Alpaca account.
+    Uses equity - last_equity (same calc as EOD, but live).
+    Returns (pnl_float, equity_float) or (None, None) on failure.
+    """
+    try:
+        acc = get_account()
+        if not acc:
+            return None, None
+        equity   = float(acc.get("equity", 0))
+        last_eq  = float(acc.get("last_equity", equity))
+        return round(equity - last_eq, 2), equity
+    except Exception as e:
+        log("DEBUG", f"Live P&L fetch failed: {e}")
+        return None, None
+
+def manage_breakeven_stops(trades_today, be_moved_set):
+    """
+    Autonomous breakeven stop management.
+
+    For each trade where the parent (buy) order has been FILLED,
+    find the stop-loss child leg and PATCH its stop_price to the
+    breakeven level (entry + $0.02).
+
+    Uses Alpaca PATCH /v2/orders/{order_id} which is supported for
+    bracket order legs to update stop_price.
+
+    Args:
+        trades_today: list of trade dicts from S.trades_today
+        be_moved_set: set of order_ids already moved to breakeven
+                      (prevents repeat attempts)
+    Returns:
+        set of newly-moved order_ids (caller should add to be_moved_set)
+    """
+    newly_moved = set()
+    for tr in trades_today:
+        order_id = tr.get("order_id", "")
+        if not order_id or order_id in be_moved_set:
+            continue
+        if tr.get("dry_run"):
+            continue  # skip simulated orders
+
+        be_price = tr.get("breakeven_stop")
+        if not be_price:
+            continue
+
+        try:
+            # Fetch the parent order with nested legs
+            full = alp_get(f"/v2/orders/{order_id}?nested=true")
+            if not full:
+                continue
+
+            parent_status = full.get("status", "")
+            if parent_status != "filled":
+                continue  # buy not yet filled — nothing to move
+
+            # Find the stop-loss child leg
+            legs = full.get("legs", [])
+            sl_leg = None
+            for lg in legs:
+                # Stop-loss leg: type is "stop" or "stop_limit"
+                if lg.get("type") in ("stop", "stop_limit"):
+                    sl_leg = lg
+                    break
+
+            if not sl_leg:
+                log("WARN", f"  [{tr['symbol']}] BE: no stop leg found in order {order_id}")
+                be_moved_set.add(order_id)  # don't retry
+                continue
+
+            sl_id     = sl_leg.get("id")
+            sl_status = sl_leg.get("status", "")
+
+            # Only modify if the stop leg is still pending (new/accepted/held)
+            if sl_status not in ("new", "accepted", "held", "pending_new"):
+                log("INFO", f"  [{tr['symbol']}] BE: stop leg status={sl_status}, "
+                            f"skipping (already filled/cancelled)")
+                be_moved_set.add(order_id)
+                continue
+
+            current_stop = float(sl_leg.get("stop_price", 0))
+            if current_stop >= be_price:
+                log("DEBUG", f"  [{tr['symbol']}] BE: stop already at ${current_stop:.2f} "
+                             f">= BE ${be_price:.2f}")
+                be_moved_set.add(order_id)
+                continue
+
+            # PATCH the stop-loss leg to breakeven
+            log("INFO", f"  [{tr['symbol']}] Moving stop to breakeven: "
+                        f"${current_stop:.2f} -> ${be_price:.2f}")
+            patch_data = {"stop_price": str(round(be_price, 2))}
+            result = alp_patch(f"/v2/orders/{sl_id}", patch_data)
+
+            if result and result.get("id"):
+                log("INFO", f"  [{tr['symbol']}] BE stop CONFIRMED | "
+                            f"new stop=${be_price:.2f} | "
+                            f"order={result.get('id')}")
+                tg_send(f"🔒 *{tr['symbol']}* stop moved to breakeven "
+                        f"${be_price:.2f}\n"
+                        f"(was ${current_stop:.2f})")
+                newly_moved.add(order_id)
+            else:
+                log("WARN", f"  [{tr['symbol']}] BE stop PATCH failed: {result}")
+                tg_send(f"⚠️ {tr['symbol']} breakeven stop move failed\n"
+                        f"Tried: ${current_stop:.2f} -> ${be_price:.2f}\n"
+                        f"Check Alpaca dashboard")
+                # Don't add to be_moved_set — will retry next cycle
+
+        except Exception as e:
+            log("ERROR", f"  [{tr.get('symbol','?')}] BE stop error: {e}")
+
+    return newly_moved
 
 def get_1min_bars(sym, limit=60):
     """Fetch 1-min bars from Alpaca IEX (Ross's primary chart timeframe)."""
@@ -274,9 +390,9 @@ def get_float(sym):
     if float_val:
         return int(float_val)
     # Fallback: weighted shares outstanding
-    wsо = result.get("weighted_shares_outstanding")
-    if wsо:
-        return int(wsо)
+    wso = result.get("weighted_shares_outstanding")
+    if wso:
+        return int(wso)
     return None
 
 def check_catalyst(sym):
@@ -286,7 +402,7 @@ def check_catalyst(sym):
     Returns (bool, headline).
     """
     try:
-        yesterday = (date.today() - timedelta(days=2)).isoformat()
+        yesterday = (now_et().date() - timedelta(days=2)).isoformat()
         url = (f"https://api.polygon.io/v2/reference/news"
                f"?ticker={sym}&published_utc.gte={yesterday}"
                f"&limit=3&apiKey={POLYGON_KEY}")
@@ -327,7 +443,7 @@ def get_premarket_high(sym):
     the bull flag breakout is a much stronger signal.
     """
     try:
-        today = date.today().isoformat()
+        today = now_et().date().isoformat()
         url = (f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/minute"
                f"/{today}/{today}?adjusted=false&sort=asc&limit=200"
                f"&apiKey={POLYGON_KEY}")
@@ -381,7 +497,7 @@ def detect_flag(sym, premarket_high=None):
         return None
 
     # Filter to today's bars only
-    today_str = date.today().isoformat()
+    today_str = now_et().date().isoformat()
     bars = [b for b in bars if b["t"][:10] == today_str]
 
     # Only use bars from 9:35 ET onward (skip opening 5-min chaos)
@@ -390,7 +506,7 @@ def detect_flag(sym, premarket_high=None):
     market_bars = []
     for b in bars:
         ts_et = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET)
-        if ts_et.hour >= 9 and ts_et.minute >= 30:
+        if ts_et.hour > 9 or (ts_et.hour == 9 and ts_et.minute >= 30):
             all_today.append(b)
         if ts_et.hour > 9 or (ts_et.hour == 9 and ts_et.minute >= 35):
             if ts_et.hour < 11 or (ts_et.hour == 11 and ts_et.minute == 0):
@@ -719,6 +835,7 @@ class State:
         self.start_time         = now_et().isoformat()
         self.last_heartbeat     = 0.0
         self.last_intraday_scan = 0.0  # unix ts of last intraday re-scan
+        self.be_moved           = set() # order_ids with stop already at breakeven
 
     def new_day(self, d):
         log("INFO", f"=== NEW DAY: {d} — state reset ===")
@@ -730,11 +847,14 @@ class State:
         self.pnl             = 0.0
         self.scanned         = False
         self.halted          = False
+        self.stopped         = False   # reset cold-market / manual stop
+        self.b_mode          = False   # reset B-mode for fresh day
         self.cushion_built   = False
         self.last_trade_time = None
         self.date            = d
         self.force_scan         = False
         self.last_intraday_scan = 0.0
+        self.be_moved           = set()
 
     def save(self):
         try:
@@ -761,46 +881,6 @@ class State:
             pass
 
 S = State()
-
-# ── Position sizing (Ross's micro/macro system) ───────────────────────────────
-def calc_qty(entry, stop, equity, trade_num, cushion_built, daily_target):
-    """
-    Ross's sizing rules from the video:
-    - Start at QUARTER size (25% of normal) for trade 1 and 2
-    - Scale to FULL size only after cushion is built (≥25% of daily target earned)
-    - If daily target already hit: half size to protect gains
-    - Never more than 25% of equity in one position
-
-    Quarter-start prevents the revenge-trading spiral on bad days while
-    still allowing full participation on good days once validated.
-    """
-    risk_dollars = equity * RISK_PCT
-
-    # Size multiplier based on day state
-    if not cushion_built:
-        # Quarter size until first cushion earned
-        multiplier = 0.25
-        size_label = "quarter (no cushion yet)"
-    elif daily_target > 0 and (equity * 0.01) > 0:
-        # Full size once cushion built
-        multiplier = 1.0
-        size_label = "full"
-
-    # Extra caution: reduce to half if daily target already fully hit
-    # (protect the green day)
-    # This is tracked externally and passed in as equity >= daily_target
-    if daily_target > 0 and equity > 0:
-        pass  # handled by caller checking S.pnl
-
-    qty = int(risk_dollars * multiplier / max(stop - entry, 0.01)) \
-        if stop < entry else \
-        int(risk_dollars * multiplier / max(entry - stop, 0.01))
-
-    # Hard cap: 25% of equity in any single position
-    max_qty = int(equity * 0.25 / entry) if entry > 0 else 0
-    qty = min(qty, max_qty)
-
-    return max(1, qty), size_label
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 def handle_cmd(text, cid):
@@ -1258,6 +1338,14 @@ def cycle():
 
     if in_window and S.watchlist and not S.halted and not S.stopped:
 
+        # ── Refresh live P&L from Alpaca each cycle ──────────────────────
+        # Without this, S.pnl stays 0.0 all session and cushion never
+        # builds / loss limit never fires (diagnosed bug #7).
+        live_pnl, live_eq = get_live_pnl()
+        if live_pnl is not None:
+            S.pnl    = live_pnl
+            S.equity = live_eq
+
         # Daily loss limit check
         if S.pnl <= MAX_LOSS:
             S.halted = True
@@ -1403,6 +1491,16 @@ def cycle():
                 S.save()
                 log("INFO", f"  [{sym}] Trade #{S.trade_count} recorded "
                             f"| size={size_label}")
+
+    # ── Breakeven stop management ─────────────────────────────────────────────
+    # Runs every cycle during trading hours if we have trades.
+    # Checks if parent buy orders are filled and moves stop to breakeven.
+    # Ross: "Once I'm in, I move my stop to breakeven as fast as possible."
+    if (in_window or (is_wd and hh >= 9 and hh < 16)) and S.trades_today:
+        newly_moved = manage_breakeven_stops(S.trades_today, S.be_moved)
+        if newly_moved:
+            S.be_moved.update(newly_moved)
+            S.save()
 
     # ── EOD scorecard 16:00–16:05 ET ─────────────────────────────────────────
     if is_wd and hh == 16 and mm < 5 and S.scanned:

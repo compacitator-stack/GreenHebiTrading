@@ -2497,8 +2497,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def start_dashboard_server():
+    """
+    Bind dashboard/health check port. Uses SO_REUSEADDR to avoid
+    'address already in use' on container restart (Zeabur sends SIGTERM
+    then immediately restarts, and the old socket may still be in TIME_WAIT).
+    """
     try:
-        server = HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler)
+        class ReusableTCPServer(HTTPServer):
+            allow_reuse_address = True
+        server = ReusableTCPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler)
         log("INFO", f"Dashboard API listening on port {DASHBOARD_PORT}")
         log("INFO", f"  Endpoints: /health  /api/dashboard  /api/log")
         server.serve_forever()
@@ -2520,6 +2527,7 @@ def main():
     # Start dashboard API server in background thread
     t = threading.Thread(target=start_dashboard_server, daemon=True)
     t.start()
+    time.sleep(0.5)  # give OS a moment to confirm port is listening
 
     startup()
     log("INFO", "Main loop active")

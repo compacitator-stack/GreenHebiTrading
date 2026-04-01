@@ -629,10 +629,20 @@ def get_float(sym):
 
 def check_catalyst(sym):
     """
-    Check Polygon news for recent catalyst.
-    Ross: news event is what "brings in the volume."
-    Returns (bool, headline).
+    Check multiple sources for a recent news catalyst.
+    Ross: "there must be a headline that justifies why the stock is moving."
+    Ross: "my best trades are when the catalyst is obvious."
+
+    Sources checked (in order):
+      1. Polygon News API — financial news articles mentioning the ticker
+      2. SEC EDGAR EFTS  — recent 8-K (material events), S-1 (IPO), or
+                           other significant filings (free, no API key)
+
+    Returns (bool, headline_string).
     """
+    headlines = []
+
+    # ── Source 1: Polygon News ────────────────────────────────────────────
     try:
         yesterday = (now_et().date() - timedelta(days=2)).isoformat()
         url = (f"https://api.polygon.io/v2/reference/news"
@@ -641,10 +651,79 @@ def check_catalyst(sym):
         resp = GET(url)
         if resp and resp.get("results"):
             headline = resp["results"][0].get("title", "News found")
-            return True, headline
-        return False, "No recent news"
+            headlines.append(("📰 Polygon", headline))
     except Exception:
-        return False, "Catalyst check unavailable"
+        pass
+
+    # ── Source 2: SEC EDGAR EFTS (full-text search) ───────────────────────
+    # Free API, no key needed. Searches recent filings mentioning the ticker.
+    # Covers 8-K (material events like FDA, contracts, offerings),
+    # S-1 (IPO registrations), and other catalyst-type filings.
+    try:
+        # EDGAR EFTS requires a User-Agent header with contact info
+        today_str = now_et().date().isoformat()
+        three_days_ago = (now_et().date() - timedelta(days=3)).isoformat()
+        edgar_url = (f"https://efts.sec.gov/LATEST/search-index"
+                     f"?q=%22{sym}%22&dateRange=custom"
+                     f"&startdt={three_days_ago}&enddt={today_str}"
+                     f"&forms=8-K,S-1,424B4,6-K"
+                     f"&from=0&size=3")
+        edgar_headers = {"User-Agent": "GreenClaw/3.0 (trading-bot@example.com)"}
+        edgar_resp = http("GET", edgar_url, headers=edgar_headers, timeout=8)
+        if edgar_resp and edgar_resp.get("hits"):
+            hits = edgar_resp["hits"].get("hits", [])
+            if hits:
+                filing = hits[0].get("_source", {})
+                form_type = filing.get("forms", "filing")
+                filed_date = filing.get("file_date", "")
+                entity = filing.get("entity_name", sym)
+                headlines.append(("📋 SEC", f"{form_type} filed {filed_date} by {entity}"))
+    except Exception as e:
+        log("DEBUG", f"  [{sym}] EDGAR check failed: {e}")
+
+    # ── Fallback: SEC EDGAR submissions API (company recent filings) ──────
+    # If EFTS didn't find anything, try the submissions endpoint
+    # which lists all recent filings for a company by CIK.
+    if not headlines:
+        try:
+            # First get CIK from ticker via SEC company tickers JSON
+            tickers_url = "https://www.sec.gov/files/company_tickers.json"
+            tickers_resp = http("GET", tickers_url,
+                                headers={"User-Agent": "GreenClaw/3.0 (trading-bot@example.com)"},
+                                timeout=8)
+            if tickers_resp:
+                cik = None
+                for entry in tickers_resp.values():
+                    if entry.get("ticker", "").upper() == sym.upper():
+                        cik = str(entry.get("cik_str", "")).zfill(10)
+                        break
+                if cik:
+                    sub_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+                    sub_resp = http("GET", sub_url,
+                                    headers={"User-Agent": "GreenClaw/3.0 (trading-bot@example.com)"},
+                                    timeout=8)
+                    if sub_resp and sub_resp.get("filings"):
+                        recent = sub_resp["filings"].get("recent", {})
+                        forms = recent.get("form", [])
+                        dates = recent.get("filingDate", [])
+                        descs = recent.get("primaryDocDescription", [])
+                        # Look for significant filings in last 3 days
+                        catalyst_forms = {"8-K", "S-1", "S-1/A", "424B4", "424B5",
+                                          "6-K", "8-K/A", "SC 13D", "SC 13D/A"}
+                        cutoff = (now_et().date() - timedelta(days=3)).isoformat()
+                        for i in range(min(10, len(forms))):
+                            if dates[i] >= cutoff and forms[i] in catalyst_forms:
+                                desc = descs[i] if i < len(descs) else forms[i]
+                                headlines.append(("📋 SEC", f"{forms[i]} filed {dates[i]}: {desc}"))
+                                break
+        except Exception as e:
+            log("DEBUG", f"  [{sym}] EDGAR submissions check failed: {e}")
+
+    # ── Return best result ────────────────────────────────────────────────
+    if headlines:
+        source, headline = headlines[0]
+        return True, f"{source}: {headline}"
+    return False, "No recent news"
 
 # ── Time-of-day RVOL ──────────────────────────────────────────────────────────
 def calc_tod_rvol(today_vol, prev_day_vol, minutes_traded):
@@ -1030,10 +1109,14 @@ def scan_premarket(b_mode=False):
                             f"(verify manually)")
 
             # ── Catalyst check ────────────────────────────────────────────────
+            # Always a SOFT WARNING in the scanner — watchlist should cast the
+            # widest net. The A-quality hard gate is enforced at TRADE TIME
+            # in cycle(), not here. This way B-mode can still trade no-catalyst
+            # stocks even if A-mode was active when the scan ran.
             has_news, headline = check_catalyst(sym)
             if not has_news:
                 log("INFO", f"  WARN {sym}: no catalyst found "
-                            f"— watchlisting anyway (verify manually)")
+                            f"— watchlisting anyway (gate enforced at trade time)")
                 headline = "⚠️ No catalyst found — verify"
 
             results.append({
@@ -1118,6 +1201,7 @@ class State:
         self.eh_trades_today    = []       # EH trade detail dicts
         self.eh_active_stops    = {}       # order_id -> stop info for software stops
         self.pm_last_scan       = 0.0      # unix ts of last premarket scan (7:00+ AM)
+        self.pm_empty_notified  = False    # already sent "no candidates" message?
         self.eh_last_late_scan  = 0.0      # unix ts of last late-session re-scan
 
     def new_day(self, d):
@@ -1145,6 +1229,7 @@ class State:
         self.eh_trades_today    = []
         self.eh_active_stops    = {}
         self.pm_last_scan       = 0.0
+        self.pm_empty_notified  = False
         self.eh_last_late_scan  = 0.0
 
     def save(self):
@@ -1742,6 +1827,13 @@ def cycle():
             if not sig:
                 continue
 
+            # ── A-quality catalyst gate (enforced at trade time, not scan time) ─
+            # Ross: "my best trades are when the catalyst is obvious"
+            # Ross: "there must be a headline that justifies why the stock is moving"
+            if not S.b_mode and not w.get("has_news"):
+                log("INFO", f"  [{sym}] SKIP: no catalyst (A-quality requires news)")
+                continue
+
             # Position size (quarter until cushion, full after)
             effective_equity = S.equity
             risk_dollars     = effective_equity * RISK_PCT
@@ -1765,8 +1857,9 @@ def cycle():
             # ── Alert before order ────────────────────────────────────────────
             pmh_line = (f"\nPMH: ${pmh:.2f}" if pmh else "")
             float_str = w.get("float_str", "unknown")
+            mode_label = "B-MODE" if S.b_mode else "A-QUALITY"
             tg_send(
-                f"🚩 *BULL FLAG: {sym}*\n"
+                f"🚩 *BULL FLAG [{mode_label}]: {sym}*\n"
                 f"Entry:  ${sig['entry']:.2f}\n"
                 f"Stop:   ${sig['stop']:.2f}  (risk ${sig['risk']:.2f}/sh)\n"
                 f"Target: ${sig['target']:.2f}  ({target_type})\n"
@@ -1892,16 +1985,22 @@ def cycle():
                     + (f" | PMH ${pmh:.2f}" if pmh else "") + "\n"
                     f"    {'📰' if w.get('has_news') else '⚠️'} "
                     f"{w.get('catalyst','')[:60]}")
-            is_first = (S.pm_last_scan == now_ts and len(S.watchlist) == len(new_found))
+            is_first = (len(S.watchlist) == len(new_found))
             tg_send(
                 f"🌅 *PREMARKET SCAN ({t.strftime('%H:%M ET')})*\n"
                 + "\n".join(lines_out)
                 + (f"\nTotal watchlist: {len(S.watchlist)}" if not is_first else "")
                 + f"\nEquity: ${S.equity:,.2f}")
-        elif S.pm_last_scan == now_ts and not S.watchlist:
-            # First scan found nothing — notify once
+            S.pm_empty_notified = False  # reset so we notify if it goes empty again
+        elif not S.watchlist and not S.pm_empty_notified:
+            # First empty scan — notify ONCE, then stay silent until candidates found
             tg_send(f"🌅 *PREMARKET SCAN — No candidates yet*\n"
-                    f"Re-scanning every {PM_SCAN_INTERVAL}min until 9:15 ET")
+                    f"Re-scanning every {PM_SCAN_INTERVAL}min until 9:15 ET\n"
+                    f"(Notifications silenced until candidates found)")
+            S.pm_empty_notified = True
+        else:
+            # Subsequent empty scans — log only, no Telegram spam
+            log("DEBUG", f"Premarket scan: no new candidates (silent)")
 
         sheets_push({
             "type": "scan", "session": "premarket",
@@ -1960,6 +2059,11 @@ def cycle():
                 if not sig:
                     continue
 
+                # A-quality catalyst gate at trade time
+                if not S.b_mode and not w.get("has_news"):
+                    log("INFO", f"  [{sym}] EH SKIP: no catalyst (A-quality requires news)")
+                    continue
+
                 # Half position sizing for EH trades
                 effective_equity = S.equity
                 risk_dollars = effective_equity * RISK_PCT * EH_SIZE_MULT
@@ -1980,7 +2084,7 @@ def cycle():
                 target_type = "HOD retest" if sig.get("target_is_hod") else "measured move"
 
                 tg_send(
-                    f"🌅 *EH BULL FLAG: {sym}*\n"
+                    f"🌅 *EH BULL FLAG [{'B-MODE' if S.b_mode else 'A-QUALITY'}]: {sym}*\n"
                     f"Session: EARLY ({t.strftime('%H:%M ET')})\n"
                     f"Entry:  ${sig['entry']:.2f}\n"
                     f"Stop:   ${sig['stop']:.2f}  (⚠️ SOFTWARE stop)\n"
@@ -2114,6 +2218,11 @@ def cycle():
                 if not sig:
                     continue
 
+                # A-quality catalyst gate at trade time
+                if not S.b_mode and not w.get("has_news"):
+                    log("INFO", f"  [{sym}] EH SKIP: no catalyst (A-quality requires news)")
+                    continue
+
                 # Half position sizing for EH trades
                 effective_equity = S.equity
                 risk_dollars = effective_equity * RISK_PCT
@@ -2137,7 +2246,7 @@ def cycle():
                 target_type = "HOD retest" if sig.get("target_is_hod") else "measured move"
 
                 tg_send(
-                    f"🌙 *EH BULL FLAG: {sym}*\n"
+                    f"🌙 *EH BULL FLAG [{'B-MODE' if S.b_mode else 'A-QUALITY'}]: {sym}*\n"
                     f"Session: LATE ({t.strftime('%H:%M ET')})\n"
                     f"Entry:  ${sig['entry']:.2f}\n"
                     f"Stop:   ${sig['stop']:.2f}  (⚠️ SOFTWARE stop)\n"

@@ -2249,16 +2249,20 @@ def cycle():
                     f"🌙 *EH BULL FLAG [{'B-MODE' if S.b_mode else 'A-QUALITY'}]: {sym}*\n"
                     f"Session: LATE ({t.strftime('%H:%M ET')})\n"
                     f"Entry:  ${sig['entry']:.2f}\n"
-                    f"Stop:   ${sig['stop']:.2f}  (⚠️ SOFTWARE stop)\n"
+                    f"Stop:   ${sig['stop']:.2f}  (risk ${sig['risk']:.2f}/sh)\n"
                     f"Target: ${sig['target']:.2f}  ({target_type})\n"
+                    f"BE stop: ${sig['breakeven_stop']:.2f}  ← move stop here after fill\n"
                     f"R:R:    {sig['rr']}:1\n"
                     f"Shares: {qty}  | Size: {size_label}\n"
                     f"Total risk: ${qty * sig['risk']:.0f}\n"
                     f"─────────────────\n"
                     f"Pattern: {sig['total_candles']} candles\n"
-                    f"⚠️ Extended hours — no broker-side stop")
+                    f"✅ Regular hours — bracket order with broker-side stop")
 
-                r = place_eh_order(sym, qty, sig["entry"], sig["stop"], sig["target"])
+                # Late session is during regular market hours (11:01-15:30)
+                # so we use standard bracket orders — NOT place_eh_order.
+                # Bracket orders provide broker-side stop-loss protection.
+                r = place_bracket(sym, qty, sig["entry"], sig["stop"], sig["target"])
 
                 if r and r.get("id"):
                     S.eh_traded_today.add(sym)
@@ -2287,7 +2291,6 @@ def cycle():
                         "catalyst":       w.get("catalyst"),
                         "b_mode":         S.b_mode,
                         "dry_run":        r.get("dry_run", False),
-                        "eh_order":       True,
                     }
                     S.eh_trades_today.append(trade_record)
                     S.trades_today.append(trade_record)  # also in combined list
@@ -2314,7 +2317,6 @@ def cycle():
                         "equity":     S.equity,
                         "trade_num":  S.trade_count,
                         "order_id":   r["id"],
-                        "eh_order":   True,
                     })
                     S.save()
                     log("INFO", f"  [{sym}] EH Trade #{S.eh_trade_count} recorded "

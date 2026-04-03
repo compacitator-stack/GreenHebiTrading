@@ -62,6 +62,7 @@ SHEETS_URL   = os.environ.get("SHEETS_WEBHOOK_URL", "")  # Google Apps Script we
 DASH_TOKEN   = os.environ.get("DASHBOARD_TOKEN",    "")  # protects /api/dashboard & /api/log
 DRY_RUN      = os.environ.get("DRY_RUN", "").lower() in ("1","true","yes")  # set DRY_RUN=true to simulate without placing orders
 EXTENDED_HOURS = os.environ.get("EXTENDED_HOURS", "").lower() in ("1","true","yes")  # enable pre/post core window trading
+B_MODE_DEFAULT = os.environ.get("B_MODE", "").lower() in ("1","true","yes")  # persistent B-mode default across restarts/day resets
 
 # ── Extended hours parameters ─────────────────────────────────────────────────
 # Experimental: allows trading outside the core 9:35–11:00 window.
@@ -76,6 +77,8 @@ EH_LATE_END     = (15, 30)   # 3:30 PM ET — stop 30 min before close
 EH_STOP_POLL_SEC = 15        # poll price every N seconds for software stop
 PM_SCAN_START   = (7, 0)     # 7:00 AM ET — first premarket scan (always runs)
 PM_SCAN_INTERVAL = 15        # re-scan every 15 min during premarket
+BREAKOUT_MAX_AGE_MIN = 5     # breakout candle must be within last N minutes
+ENTRY_MAX_DISTANCE   = 1.0   # skip trade if price > entry + (N × risk) — prevents chasing stale patterns
 
 # ── Strategy parameters (all sourced from Ross's exact rules) ─────────────────
 RISK_PCT       = 0.005   # 0.5% equity at risk per trade
@@ -935,12 +938,29 @@ def detect_flag(sym, premarket_high=None, session="core"):
                 # ── Breakout signal: bar AFTER flag makes new high ────────────
                 # Ross: "first candle to make a new high — that's when you buy"
                 breakout = False
+                breakout_bar = None
                 for ci in range(fe, min(fe + 3, len(window))):
                     if float(window[ci]["h"]) > flag_high:
                         breakout = True
+                        breakout_bar = window[ci]
                         break
                 if not breakout:
                     continue
+
+                # ── Breakout recency: must be within last N minutes ───────────
+                # Prevents acting on stale patterns where the move already
+                # happened. A flag that broke out 30 min ago is useless —
+                # the entry price is stale and the limit order won't fill.
+                try:
+                    bo_time = datetime.fromisoformat(
+                        breakout_bar["t"].replace("Z", "+00:00")).astimezone(ET)
+                    bo_age_min = (now_et() - bo_time).total_seconds() / 60
+                    if bo_age_min > BREAKOUT_MAX_AGE_MIN:
+                        log("INFO", f"  [{sym}] SKIP: breakout {bo_age_min:.0f}min old "
+                                    f"(max {BREAKOUT_MAX_AGE_MIN}min)")
+                        continue
+                except Exception:
+                    pass  # if timestamp parsing fails, allow the trade
 
                 # ── Trade levels ──────────────────────────────────────────────
                 entry = round(flag_high + 0.02, 2)   # 2¢ above flag high
@@ -1184,7 +1204,7 @@ class State:
         self.halted           = False  # loss-limit auto-halt
         self.stopped          = False  # manual /stop
         self.core_cold_halted = False  # cold market halt (core window only)
-        self.b_mode           = False
+        self.b_mode           = B_MODE_DEFAULT  # from env var, overridable via /bmode
         self.cushion_built    = False  # True once 25% of daily target earned
         self.last_trade_time  = None   # datetime of last trade attempt
         self.date             = ""
@@ -1216,7 +1236,7 @@ class State:
         self.halted          = False
         self.stopped         = False   # reset cold-market / manual stop
         self.core_cold_halted = False  # reset cold market core halt
-        self.b_mode          = False   # reset B-mode for fresh day
+        self.b_mode          = B_MODE_DEFAULT  # reset to env var default (not always False)
         self.cushion_built   = False
         self.last_trade_time = None
         self.date            = d
@@ -1827,6 +1847,20 @@ def cycle():
             if not sig:
                 continue
 
+            # ── Entry price proximity: skip if price has run away ─────────
+            # If current price is already beyond entry + risk, the move
+            # happened and a limit buy at the entry price won't fill
+            # (or fills on a failing pullback — worse).
+            bars_check = get_1min_bars(sym, limit=2)
+            if bars_check:
+                live_price = float(bars_check[-1]["c"])
+                max_entry_dist = sig["entry"] + (ENTRY_MAX_DISTANCE * sig["risk"])
+                if live_price > max_entry_dist:
+                    log("INFO", f"  [{sym}] SKIP: price ${live_price:.2f} > "
+                                f"entry ${sig['entry']:.2f} + {ENTRY_MAX_DISTANCE}×risk "
+                                f"(${max_entry_dist:.2f}) — move already happened")
+                    continue
+
             # ── A-quality catalyst gate (enforced at trade time, not scan time) ─
             # Ross: "my best trades are when the catalyst is obvious"
             # Ross: "there must be a headline that justifies why the stock is moving"
@@ -2059,6 +2093,16 @@ def cycle():
                 if not sig:
                     continue
 
+                # ── Entry price proximity check ──────────────────────────────
+                bars_check = get_1min_bars(sym, limit=2)
+                if bars_check:
+                    live_price = float(bars_check[-1]["c"])
+                    max_entry_dist = sig["entry"] + (ENTRY_MAX_DISTANCE * sig["risk"])
+                    if live_price > max_entry_dist:
+                        log("INFO", f"  [{sym}] EH SKIP: price ${live_price:.2f} > "
+                                    f"${max_entry_dist:.2f} — move already happened")
+                        continue
+
                 # A-quality catalyst gate at trade time
                 if not S.b_mode and not w.get("has_news"):
                     log("INFO", f"  [{sym}] EH SKIP: no catalyst (A-quality requires news)")
@@ -2217,6 +2261,16 @@ def cycle():
                 sig = detect_flag(sym, premarket_high=pmh, session="late")
                 if not sig:
                     continue
+
+                # ── Entry price proximity check ──────────────────────────────
+                bars_check = get_1min_bars(sym, limit=2)
+                if bars_check:
+                    live_price = float(bars_check[-1]["c"])
+                    max_entry_dist = sig["entry"] + (ENTRY_MAX_DISTANCE * sig["risk"])
+                    if live_price > max_entry_dist:
+                        log("INFO", f"  [{sym}] EH SKIP: price ${live_price:.2f} > "
+                                    f"${max_entry_dist:.2f} — move already happened")
+                        continue
 
                 # A-quality catalyst gate at trade time
                 if not S.b_mode and not w.get("has_news"):

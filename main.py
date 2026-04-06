@@ -41,7 +41,14 @@ Extended Hours (EXTENDED_HOURS=true):
 """
 
 import os, sys, json, time, ssl, signal, math, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.request, urllib.error, urllib.parse
+try:
+    import websocket as _websocket_lib   # pip install websocket-client
+    _WS_AVAILABLE = True
+except ImportError:
+    _websocket_lib = None
+    _WS_AVAILABLE = False
 from datetime import datetime, timezone, timedelta, date
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -79,6 +86,8 @@ PM_SCAN_START   = (7, 0)     # 7:00 AM ET — first premarket scan (always runs)
 PM_SCAN_INTERVAL = 15        # re-scan every 15 min during premarket
 BREAKOUT_MAX_AGE_MIN = 8     # breakout candle must be within last N minutes
 ENTRY_MAX_DISTANCE   = 1.0   # skip trade if price > entry + (N × risk) — prevents chasing stale patterns
+MAX_ENTRY_SLIP       = 0.10  # stop_limit ceiling: max cents above entry trigger willing to pay
+MAX_SPREAD_PCT       = 2.0   # skip trade if bid/ask spread > this % of ask price (wide spread = bad fill)
 
 # ── Strategy parameters (all sourced from Ross's exact rules) ─────────────────
 RISK_PCT       = 0.005   # 0.5% equity at risk per trade
@@ -211,6 +220,25 @@ def get_equity():    return float(get_account().get("equity", 0))
 def get_positions(): return alp_get("/v2/positions") or []
 def get_orders():    return alp_get("/v2/orders?status=open&limit=50") or []
 
+def get_quote(sym):
+    """
+    Fetch latest bid/ask quote from Alpaca IEX.
+    Returns (bid, ask) floats, or (None, None) on failure.
+    Used to check spread width before placing an order and to set
+    a tighter stop_limit ceiling on the buy leg.
+    """
+    url = (f"https://data.alpaca.markets/v2/stocks/{sym}"
+           f"/quotes/latest?feed=iex")
+    resp = GET(url, h=alp_h())
+    if not resp or "quote" not in resp:
+        return None, None
+    q   = resp["quote"]
+    bid = float(q.get("bp", 0) or 0)
+    ask = float(q.get("ap", 0) or 0)
+    if bid <= 0 or ask <= 0:
+        return None, None
+    return bid, ask
+
 def get_live_pnl():
     """
     Fetch real-time intraday P&L from Alpaca account.
@@ -326,7 +354,16 @@ def manage_breakeven_stops(trades_today, be_moved_set):
     return newly_moved
 
 def get_1min_bars(sym, limit=60):
-    """Fetch 1-min bars from Alpaca IEX (Ross's primary chart timeframe)."""
+    """
+    Fetch 1-min bars. Uses Polygon WebSocket cache when available
+    (seeded on subscribe + updated in real-time). Falls back to
+    Alpaca IEX REST when cache is empty or WS is unavailable.
+    """
+    with _bar_lock:
+        cached = list(_bar_cache.get(sym, []))
+    if cached:
+        return cached[-limit:]
+    # REST fallback — used until WS is connected and cache seeded
     url = (f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
            f"?timeframe=1Min&limit={limit}&feed=iex&adjustment=raw")
     resp = GET(url, h=alp_h())
@@ -334,28 +371,184 @@ def get_1min_bars(sym, limit=60):
         return []
     return resp["bars"]  # [{t, o, h, l, c, v, vw, n}, ...]
 
-def place_bracket(sym, qty, entry, stop, target):
+
+# ── Polygon WebSocket — real-time 1-min bar streaming ─────────────────────────
+# Polygon Starter plan ($29/mo) includes real-time minute aggregate (AM.*)
+# WebSocket. This replaces the REST poll in get_1min_bars() after each symbol
+# is subscribed and seeded, cutting bar-data latency from poll-interval seconds
+# to ~0s (bars arrive within 1s of minute close).
+
+_bar_cache   = {}            # sym -> [bar_dict, ...]  (Alpaca format)
+_bar_lock    = threading.Lock()
+_ws_subscribed = set()       # symbols currently subscribed on WS
+_ws_auth_ok  = False         # True once Polygon auth handshake completes
+_polygon_ws  = None          # active WebSocketApp instance
+
+
+def _normalize_polygon_bar(e):
+    """Convert Polygon AM WebSocket event dict to Alpaca bar format."""
+    ts = datetime.fromtimestamp(
+        e["s"] / 1000, tz=timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "t":  ts,
+        "o":  float(e.get("o",  0)),
+        "h":  float(e.get("h",  0)),
+        "l":  float(e.get("l",  0)),
+        "c":  float(e.get("c",  0)),
+        "v":  int(  e.get("v",  0)),
+        "vw": float(e.get("vw", 0)),
+        "n":  int(  e.get("z",  0)),
+    }
+
+
+def _on_ws_open(ws):
+    log("INFO", "Polygon WS: connected — authenticating")
+    ws.send(json.dumps({"action": "auth", "params": POLYGON_KEY}))
+
+
+def _on_ws_message(ws, message):
+    global _ws_auth_ok
+    try:
+        events = json.loads(message)
+    except Exception:
+        return
+    for e in events:
+        ev     = e.get("ev", "")
+        status = e.get("status", "")
+
+        if ev == "status" and status == "auth_success":
+            _ws_auth_ok = True
+            log("INFO", "Polygon WS: authenticated")
+            # Re-subscribe any symbols already in the subscribed set
+            # (handles reconnection mid-session)
+            with _bar_lock:
+                syms = list(_ws_subscribed)
+            if syms:
+                params = ",".join(f"AM.{s}" for s in syms)
+                ws.send(json.dumps({"action": "subscribe", "params": params}))
+                log("INFO", f"Polygon WS: re-subscribed {len(syms)} symbol(s)")
+
+        elif ev == "status" and status == "auth_failed":
+            log("ERROR", "Polygon WS: auth FAILED — check POLYGON_API_KEY")
+
+        elif ev == "AM":
+            sym = e.get("sym", "")
+            if not sym:
+                continue
+            bar = _normalize_polygon_bar(e)
+            with _bar_lock:
+                if sym not in _bar_cache:
+                    _bar_cache[sym] = []
+                _bar_cache[sym].append(bar)
+                if len(_bar_cache[sym]) > 120:   # keep 2 hours max
+                    _bar_cache[sym] = _bar_cache[sym][-120:]
+
+
+def _on_ws_error(ws, error):
+    log("WARN", f"Polygon WS error: {error}")
+
+
+def _on_ws_close(ws, code, msg):
+    global _ws_auth_ok
+    _ws_auth_ok = False
+    log("INFO", f"Polygon WS closed (code={code}) — will reconnect")
+
+
+def start_polygon_ws():
+    """
+    Open Polygon WebSocket in a daemon thread. Reconnects automatically
+    on disconnect with a 5-second back-off.
+    Subscription: AM.* (real-time minute aggregate bars).
+    """
+    global _polygon_ws
+    if not _WS_AVAILABLE:
+        log("WARN", "websocket-client not installed — WS streaming disabled. "
+                    "Run: pip install websocket-client")
+        return
+    while True:
+        try:
+            _polygon_ws = _websocket_lib.WebSocketApp(
+                "wss://socket.polygon.io/stocks",
+                on_open    = _on_ws_open,
+                on_message = _on_ws_message,
+                on_error   = _on_ws_error,
+                on_close   = _on_ws_close,
+            )
+            _polygon_ws.run_forever(ping_interval=30, ping_timeout=10)
+        except Exception as e:
+            log("WARN", f"Polygon WS thread error: {e}")
+        time.sleep(5)   # back-off before reconnect
+
+
+def ws_subscribe(symbols):
+    """
+    Subscribe to real-time AM (minute bar) events for a list of symbols,
+    and seed the cache from REST so detect_flag() works immediately.
+    Idempotent — safe to call repeatedly; only acts on new symbols.
+    """
+    global _polygon_ws
+    new_syms = [s for s in symbols if s not in _ws_subscribed]
+    if not new_syms:
+        return
+
+    # Seed bar cache from REST for each new symbol so detect_flag()
+    # has history immediately (WS only streams bars going forward).
+    for sym in new_syms:
+        url = (f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
+               f"?timeframe=1Min&limit=60&feed=iex&adjustment=raw")
+        resp = GET(url, h=alp_h())
+        if resp and "bars" in resp:
+            with _bar_lock:
+                _bar_cache[sym] = resp["bars"][-60:]
+            log("DEBUG", f"Polygon WS: seeded {len(resp['bars'])} bars for {sym}")
+
+    # Subscribe on the live WS connection (if auth is complete)
+    if _polygon_ws and _ws_auth_ok:
+        params = ",".join(f"AM.{s}" for s in new_syms)
+        try:
+            _polygon_ws.send(json.dumps({"action": "subscribe", "params": params}))
+            log("INFO", f"Polygon WS: subscribed AM.* for {new_syms}")
+        except Exception as e:
+            log("WARN", f"Polygon WS subscribe error: {e}")
+
+    _ws_subscribed.update(new_syms)
+
+def place_bracket(sym, qty, entry, stop, target, ask=None):
     """
     Submit bracket order to Alpaca and verify all three legs were accepted.
     In DRY_RUN mode, simulates the order without touching Alpaca.
+
+    Uses stop_limit for the buy leg so it triggers ON the breakout (when
+    price rises through entry) rather than resting passively and only
+    filling on a pullback.  ask is the current best ask; if provided,
+    the stop_limit ceiling is set to ask + $0.02 for tighter control.
+
     Returns order dict or None.
     """
-    log("INFO", f"ORDER: {sym} BUY {qty} @ ${entry:.2f} "
-                f"SL ${stop:.2f} TP ${target:.2f}")
+    # stop_limit ceiling: max price willing to pay above the trigger
+    if ask and ask > entry:
+        ceiling = round(ask + 0.02, 2)   # pay up to current ask + 2¢
+    else:
+        ceiling = round(entry + MAX_ENTRY_SLIP, 2)
+
+    log("INFO", f"ORDER: {sym} BUY {qty} STOP-LMT trigger=${entry:.2f} "
+                f"ceil=${ceiling:.2f} SL=${stop:.2f} TP=${target:.2f}")
 
     # ── Dry-run mode: simulate without placing ────────────────────────────────
     if DRY_RUN:
         fake_id = f"DRY-{sym}-{int(time.time())}"
         log("INFO", f"  🔵 DRY RUN — simulated order id={fake_id}")
         tg_send(f"🔵 *DRY RUN* — would place:\n"
-                f"{sym} BUY {qty}sh @ ${entry:.2f}\n"
+                f"{sym} BUY {qty}sh STOP-LMT trigger=${entry:.2f} ceil=${ceiling:.2f}\n"
                 f"SL ${stop:.2f} | TP ${target:.2f}")
         return {
             "id":          fake_id,
             "status":      "simulated",
             "symbol":      sym,
             "qty":         str(qty),
-            "limit_price": str(entry),
+            "stop_price":  str(entry),
+            "limit_price": str(ceiling),
             "legs":        "simulated",
             "dry_run":     True,
         }
@@ -363,8 +556,9 @@ def place_bracket(sym, qty, entry, stop, target):
     # ── Live order ────────────────────────────────────────────────────────────
     order = {
         "symbol": sym, "qty": str(qty), "side": "buy",
-        "type": "limit", "time_in_force": "day",
-        "limit_price": str(round(entry, 2)),
+        "type": "stop_limit", "time_in_force": "day",
+        "stop_price":  str(round(entry,   2)),   # breakout trigger
+        "limit_price": str(round(ceiling, 2)),   # max willing to pay
         "order_class": "bracket",
         "take_profit": {"limit_price": str(round(target, 2))},
         "stop_loss":   {"stop_price":  str(round(stop,  2))}
@@ -379,8 +573,7 @@ def place_bracket(sym, qty, entry, stop, target):
     log("INFO", f"  ✅ Order accepted | id={order_id}")
 
     # ── Verify bracket legs were created (Alpaca-specific check) ─────────────
-    # Query the order back after a short delay to confirm legs exist
-    time.sleep(1.5)
+    # Alpaca creates bracket legs atomically on acceptance, no sleep needed.
     full = alp_get(f"/v2/orders/{order_id}")
     if not full:
         log("WARN", f"  ⚠️  Could not re-query order {order_id} for leg verification")
@@ -1268,6 +1461,7 @@ class State:
                     "stopped":       self.stopped,
                     "b_mode":        self.b_mode,
                     "started":       self.start_time,
+                    "be_moved":      list(self.be_moved),
                 }, f, indent=2)
         except Exception:
             pass
@@ -1559,6 +1753,18 @@ def startup():
     except Exception:
         pass
 
+    # Restore be_moved set so breakeven stop moves aren't re-attempted
+    # after a mid-session restart.
+    try:
+        with open(STATUS_FILE) as f:
+            saved = json.load(f)
+        restored = saved.get("be_moved", [])
+        if restored:
+            S.be_moved = set(restored)
+            log("INFO", f"Restored be_moved: {len(S.be_moved)} order(s) skipped")
+    except Exception:
+        pass
+
     tg_send(
         f"🟢 *GreenClaw v3 Started*\n"
         f"Equity: ${S.equity:,.2f}\n"
@@ -1836,15 +2042,26 @@ def cycle():
         positions  = get_positions()
         held_syms  = {p.get("symbol", "") for p in (positions or [])}
 
-        for w in S.watchlist:
-            sym = w["symbol"]
-            if sym in S.traded_today:
-                continue
-            if sym in held_syms:
-                continue
+        # Fetch bar data for all candidates in parallel — cuts per-cycle
+        # detection time by ~Nx (N = watchlist size) vs. sequential calls.
+        candidates = [w for w in S.watchlist
+                      if w["symbol"] not in S.traded_today
+                      and w["symbol"] not in held_syms]
 
-            pmh = S.premarket_highs.get(sym)
-            sig = detect_flag(sym, premarket_high=pmh)
+        def _detect(w):
+            pmh = S.premarket_highs.get(w["symbol"])
+            return w, detect_flag(w["symbol"], premarket_high=pmh)
+
+        signals = []
+        with ThreadPoolExecutor(max_workers=min(5, len(candidates) or 1)) as ex:
+            for w, sig in ex.map(_detect, candidates):
+                if sig:
+                    signals.append((w, sig))
+
+        for w, sig in signals:
+            sym = w["symbol"]
+            if sym in S.traded_today:  # re-check: may have changed during fetch
+                continue
             if not sig:
                 continue
 
@@ -1895,13 +2112,38 @@ def cycle():
             # HOD / target type label
             target_type = "HOD retest" if sig.get("target_is_hod") else "measured move"
 
+            # ── Spread check (L2 proxy via best bid/ask) ─────────────────────
+            # Wide spreads on small-caps erode effective R:R significantly.
+            # A 2% spread on a $5 stock = $0.10 — consumes one third of a
+            # typical $0.30 risk before price even moves against us.
+            bid, ask = get_quote(sym)
+            live_ask = ask  # passed to place_bracket for tighter ceiling
+            if bid and ask:
+                spread     = ask - bid
+                spread_pct = (spread / ask) * 100
+                if spread_pct > MAX_SPREAD_PCT:
+                    log("INFO", f"  [{sym}] SKIP: spread ${spread:.2f} "
+                                f"({spread_pct:.1f}%) > {MAX_SPREAD_PCT}% — "
+                                f"bid ${bid:.2f} ask ${ask:.2f}")
+                    tg_send(f"⚠️ *{sym}* skipped — spread ${spread:.2f} "
+                            f"({spread_pct:.1f}%) too wide\n"
+                            f"bid ${bid:.2f} | ask ${ask:.2f}")
+                    continue
+                log("DEBUG", f"  [{sym}] Spread OK: ${spread:.2f} "
+                             f"({spread_pct:.1f}%) | bid ${bid:.2f} ask ${ask:.2f}")
+            else:
+                log("DEBUG", f"  [{sym}] Quote unavailable — proceeding without spread check")
+                live_ask = None
+
             # ── Alert before order ────────────────────────────────────────────
             pmh_line = (f"\nPMH: ${pmh:.2f}" if pmh else "")
             float_str = w.get("float_str", "unknown")
             mode_label = "B-MODE" if S.b_mode else "A-QUALITY"
+            spread_line = (f"\nSpread: ${ask-bid:.2f} ({(ask-bid)/ask*100:.1f}%)"
+                           if bid and ask else "")
             tg_send(
                 f"🚩 *BULL FLAG [{mode_label}]: {sym}*\n"
-                f"Entry:  ${sig['entry']:.2f}\n"
+                f"Entry:  ${sig['entry']:.2f} (stop-limit, ceil ${round(sig['entry']+MAX_ENTRY_SLIP,2):.2f})\n"
                 f"Stop:   ${sig['stop']:.2f}  (risk ${sig['risk']:.2f}/sh)\n"
                 f"Target: ${sig['target']:.2f}  ({target_type})\n"
                 f"BE stop: ${sig['breakeven_stop']:.2f}  ← move stop here after fill\n"
@@ -1915,9 +2157,9 @@ def cycle():
                 f"Flag vol: {sig['flag_vol_ratio']:.0%} of pole\n"
                 f"VWAP: ${sig['vwap']:.2f} | HOD: ${sig['hod']:.2f} | "
                 f"Float: {float_str}"
-                + pmh_line)
+                + spread_line + pmh_line)
 
-            r = place_bracket(sym, qty, sig["entry"], sig["stop"], sig["target"])
+            r = place_bracket(sym, qty, sig["entry"], sig["stop"], sig["target"], ask=live_ask)
 
             if r and r.get("id"):
                 S.traded_today.add(sym)
@@ -2700,18 +2942,48 @@ def _shutdown(sig, _):
     sys.exit(0)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+def _cycle_loop():
+    """
+    Trading cycle runs every 8 seconds on its own daemon thread,
+    completely independent of Telegram polling latency.
+    Previously cycle() was gated behind a 25-second Telegram long-poll,
+    which meant pattern detection could be up to 26 seconds late.
+    Also subscribes any new watchlist symbols to Polygon WS after each cycle.
+    """
+    while True:
+        try:
+            cycle()
+            S.save()
+            # Subscribe WS bars for any symbols added to watchlist this cycle.
+            # ws_subscribe() is idempotent — only acts on new symbols.
+            if S.watchlist:
+                ws_subscribe([w["symbol"] for w in S.watchlist])
+        except Exception as e:
+            log("ERROR", f"Cycle error: {e}")
+        time.sleep(8)
+
+
 def main():
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT,  _shutdown)
 
     # Start dashboard API server in background thread
-    t = threading.Thread(target=start_dashboard_server, daemon=True)
-    t.start()
+    t_dash = threading.Thread(target=start_dashboard_server, daemon=True)
+    t_dash.start()
     time.sleep(0.5)  # give OS a moment to confirm port is listening
 
     startup()
-    log("INFO", "Main loop active")
 
+    # Start Polygon WebSocket for real-time 1-min bar streaming
+    t_ws = threading.Thread(target=start_polygon_ws, daemon=True)
+    t_ws.start()
+
+    # Start trading cycle on its own thread — decoupled from Telegram
+    t_cycle = threading.Thread(target=_cycle_loop, daemon=True)
+    t_cycle.start()
+    log("INFO", "Main loop active — cycle: 8s thread | Polygon WS: live bars | Telegram: long-poll 25s")
+
+    # Main thread: Telegram commands only
     while True:
         try:
             updates = tg_poll(S.offset, 25)
@@ -2723,16 +2995,13 @@ def main():
                     handle_cmd(txt, cid)
                 S.offset = u["update_id"] + 1
 
-            cycle()
-            S.save()
-
         except KeyboardInterrupt:
             log("INFO", "Keyboard interrupt")
             tg_send("🔴 GreenClaw stopped")
             break
         except Exception as e:
-            log("ERROR", f"Loop error: {e}")
-            time.sleep(10)
+            log("ERROR", f"Telegram loop error: {e}")
+            time.sleep(2)
 
 if __name__ == "__main__":
     main()

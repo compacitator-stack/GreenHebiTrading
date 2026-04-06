@@ -438,11 +438,15 @@ def _on_ws_message(ws, message):
                 continue
             bar = _normalize_polygon_bar(e)
             with _bar_lock:
+                first_bar = sym not in _bar_cache
                 if sym not in _bar_cache:
                     _bar_cache[sym] = []
                 _bar_cache[sym].append(bar)
                 if len(_bar_cache[sym]) > 120:   # keep 2 hours max
                     _bar_cache[sym] = _bar_cache[sym][-120:]
+            if first_bar:
+                log("DEBUG", f"Polygon WS: first live bar received for {sym} "
+                             f"c=${bar['c']} v={bar['v']}")
 
 
 def _on_ws_error(ws, error):
@@ -1638,6 +1642,7 @@ def handle_cmd(text, cid):
             "/orders    — show open orders from Alpaca\n"
             "/report    — daily summary (trades + watchlist)\n"
             "/bmode     — toggle B-mode (looser criteria)\n"
+            "/wsstatus  — Polygon WebSocket connection + bar cache state\n"
             "/help      — this message\n\n"
             f"*A-quality*: gap≥{GAP_MIN}% rvol≥{RVOL_MIN}x "
             f"float≤{FLOAT_MAX/1e6:.0f}M ${PRICE_LO}-${PRICE_HI}\n"
@@ -1720,6 +1725,29 @@ def handle_cmd(text, cid):
                + "\nTrades:\n" + tlines + "\n"
                + "\n_/logs for full audit trail_")
         tg_send(msg)
+
+    elif cmd == "/wsstatus":
+        with _bar_lock:
+            syms_cached = {s: len(b) for s, b in _bar_cache.items()}
+        subscribed = sorted(_ws_subscribed)
+        auth_state = "✅ authenticated" if _ws_auth_ok else "❌ not authenticated"
+        connected  = "✅ connected" if (_polygon_ws and _ws_auth_ok) else "❌ disconnected"
+        ws_avail   = "✅ installed" if _WS_AVAILABLE else "❌ missing (pip install websocket-client)"
+
+        cache_lines = "\n".join(
+            f"  {s}: {n} bars" for s, n in sorted(syms_cached.items())
+        ) or "  (empty)"
+
+        tg_send(
+            f"📡 *Polygon WebSocket Status*\n"
+            f"Library:   {ws_avail}\n"
+            f"Socket:    {connected}\n"
+            f"Auth:      {auth_state}\n"
+            f"Subscribed: {len(subscribed)} symbol(s)\n"
+            f"  {', '.join(subscribed) if subscribed else '(none)'}\n\n"
+            f"Bar cache ({len(syms_cached)} symbol(s)):\n"
+            f"{cache_lines}"
+        )
 
     else:
         log("DEBUG", f"Unknown command: {cmd}")

@@ -77,7 +77,7 @@ EH_LATE_END     = (15, 30)   # 3:30 PM ET — stop 30 min before close
 EH_STOP_POLL_SEC = 15        # poll price every N seconds for software stop
 PM_SCAN_START   = (7, 0)     # 7:00 AM ET — first premarket scan (always runs)
 PM_SCAN_INTERVAL = 15        # re-scan every 15 min during premarket
-BREAKOUT_MAX_AGE_MIN = 5     # breakout candle must be within last N minutes
+BREAKOUT_MAX_AGE_MIN = 8     # breakout candle must be within last N minutes
 ENTRY_MAX_DISTANCE   = 1.0   # skip trade if price > entry + (N × risk) — prevents chasing stale patterns
 
 # ── Strategy parameters (all sourced from Ross's exact rules) ─────────────────
@@ -105,8 +105,9 @@ FLAG_MAX_BARS  = 4       # flag: at most 4 candles (pole+flag = 7 max per Ross)
 
 # Cold market rules (Ross: "if no trade in 30 min, call it")
 NO_TRADE_HALT_MINS   = 30   # stop trying if no valid setup for this many minutes
-INTRADAY_SCAN_MINS   = 15   # re-scan every N minutes during trading window
+INTRADAY_SCAN_MINS   = 5    # re-scan every N minutes during trading window
                             # catches stocks that emerge mid-session (today: ELAB, ASTC)
+                            # 5 min = ~17 scans over 9:35-11:00; fast enough to catch early moves
 
 # B-mode (looser criteria, only if no A-quality by 10:00 ET, max 1 trade)
 B_GAP_MIN      = 2.0
@@ -1860,6 +1861,12 @@ def cycle():
                                 f"entry ${sig['entry']:.2f} + {ENTRY_MAX_DISTANCE}×risk "
                                 f"(${max_entry_dist:.2f}) — move already happened")
                     continue
+                elif live_price > sig["entry"]:
+                    # Price already above entry: a limit buy here only fills on
+                    # pullback, which means entering a declining move — skip.
+                    log("INFO", f"  [{sym}] SKIP: price ${live_price:.2f} already above "
+                                f"entry ${sig['entry']:.2f} — limit would fill on pullback only")
+                    continue
 
             # ── A-quality catalyst gate (enforced at trade time, not scan time) ─
             # Ross: "my best trades are when the catalyst is obvious"
@@ -2102,6 +2109,10 @@ def cycle():
                         log("INFO", f"  [{sym}] EH SKIP: price ${live_price:.2f} > "
                                     f"${max_entry_dist:.2f} — move already happened")
                         continue
+                    elif live_price > sig["entry"]:
+                        log("INFO", f"  [{sym}] EH SKIP: price ${live_price:.2f} already above "
+                                    f"entry ${sig['entry']:.2f} — limit would fill on pullback only")
+                        continue
 
                 # A-quality catalyst gate at trade time
                 if not S.b_mode and not w.get("has_news"):
@@ -2270,6 +2281,10 @@ def cycle():
                     if live_price > max_entry_dist:
                         log("INFO", f"  [{sym}] EH SKIP: price ${live_price:.2f} > "
                                     f"${max_entry_dist:.2f} — move already happened")
+                        continue
+                    elif live_price > sig["entry"]:
+                        log("INFO", f"  [{sym}] EH SKIP: price ${live_price:.2f} already above "
+                                    f"entry ${sig['entry']:.2f} — limit would fill on pullback only")
                         continue
 
                 # A-quality catalyst gate at trade time

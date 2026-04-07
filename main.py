@@ -117,6 +117,9 @@ NO_TRADE_HALT_MINS   = 30   # stop trying if no valid setup for this many minute
 INTRADAY_SCAN_MINS   = 5    # re-scan every N minutes during trading window
                             # catches stocks that emerge mid-session (today: ELAB, ASTC)
                             # 5 min = ~17 scans over 9:35-11:00; fast enough to catch early moves
+INTRADAY_VOL_MAX = 25_000_000  # Ross (Apr 1): above ~25-30M intraday shares the tape becomes noisy
+                               # (scalpers create 1-cent-spread crowding — impossible to read trend)
+                               # Also caught SKYQ (90M shares, Apr 2) as a second filter
 
 # B-mode (looser criteria, only if no A-quality by 10:00 ET, max 1 trade)
 B_GAP_MIN      = 2.0
@@ -230,7 +233,7 @@ def get_quote(sym):
     url = (f"https://data.alpaca.markets/v2/stocks/{sym}"
            f"/quotes/latest?feed=iex")
     resp = GET(url, h=alp_h())
-    if not resp or not resp.get("quote"):
+    if not resp or "quote" not in resp:
         return None, None
     q   = resp["quote"]
     bid = float(q.get("bp", 0) or 0)
@@ -367,7 +370,7 @@ def get_1min_bars(sym, limit=60):
     url = (f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
            f"?timeframe=1Min&limit={limit}&feed=iex&adjustment=raw")
     resp = GET(url, h=alp_h())
-    if not resp or not resp.get("bars"):
+    if not resp or "bars" not in resp:
         return []
     return resp["bars"]  # [{t, o, h, l, c, v, vw, n}, ...]
 
@@ -502,13 +505,10 @@ def ws_subscribe(symbols):
         url = (f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
                f"?timeframe=1Min&limit=60&feed=iex&adjustment=raw")
         resp = GET(url, h=alp_h())
-        if resp and resp.get("bars"):
+        if resp and "bars" in resp:
             with _bar_lock:
                 _bar_cache[sym] = resp["bars"][-60:]
             log("DEBUG", f"Polygon WS: seeded {len(resp['bars'])} bars for {sym}")
-        else:
-            log("WARN", f"Polygon WS: no REST bars to seed for {sym} "
-                        f"— will subscribe anyway, bars will stream live")
 
     # Subscribe on the live WS connection (if auth is complete)
     if _polygon_ws and _ws_auth_ok:
@@ -950,6 +950,42 @@ def calc_tod_rvol(today_vol, prev_day_vol, minutes_traded):
         return 0.0
     return today_vol / expected_vol
 
+# ── SSR (Reg SHO circuit breaker) ────────────────────────────────────────────
+# When a stock falls 10%+ from its previous close the SEC's Reg SHO circuit
+# breaker activates for the remainder of that day and the next trading day.
+# Ross (Mar 31): "SSR stocks — shorts stacking the ask makes breakouts harder."
+# Applied in A-mode only at scan time. B-mode can still trade SSR stocks.
+# The list is fetched once per calendar day and cached; fetch errors fail-open.
+
+_ssr_cache: dict = {"date": "", "symbols": set()}
+
+def is_on_ssr(sym: str) -> bool:
+    """Return True if sym is currently under the Reg SHO short-sale restriction."""
+    global _ssr_cache
+    today = now_et().strftime("%Y-%m-%d")
+    if _ssr_cache["date"] != today:
+        # NASDAQ publishes the live Reg SHO circuit-breaker list (pipe-delimited,
+        # columns: Symbol | SecurityName | DateAdded).
+        url = "https://www.nasdaqtrader.com/dynamic/SHOData/RegSHOdaily.txt"
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "GreenClaw/3.0 (trading-bot@example.com)"})
+            with urllib.request.urlopen(req, timeout=8, context=_ssl) as r:
+                content = r.read().decode("utf-8", errors="ignore")
+            symbols: set = set()
+            for line in content.splitlines():
+                parts = line.split("|")
+                if parts and 1 <= len(parts[0].strip()) <= 5:
+                    symbols.add(parts[0].strip().upper())
+            _ssr_cache = {"date": today, "symbols": symbols}
+            log("INFO", f"SSR list loaded: {len(symbols)} symbol(s) under Reg SHO circuit breaker")
+        except Exception as e:
+            # Fail open — never block a trade because of a failed fetch
+            log("DEBUG", f"SSR list fetch failed (non-fatal, treating all as non-SSR): {e}")
+            _ssr_cache = {"date": today, "symbols": set()}
+    return sym.upper() in _ssr_cache["symbols"]
+
+
 # ── Pre-market high ───────────────────────────────────────────────────────────
 def get_premarket_high(sym):
     """
@@ -1313,6 +1349,10 @@ def scan_premarket(b_mode=False):
             effective_rvol_thr = rvol_thr / 10.0 if mins_traded is None else rvol_thr
             if tod_rvol < effective_rvol_thr:
                 fails.append("rvol " + str(round(tod_rvol,2)) + "x<" + str(round(effective_rvol_thr,2)) + "x")
+            # Intraday volume ceiling: above ~25M shares the tape becomes noisy
+            # (Ross Apr 1 / Apr 2; applies pre-market too — heavy pre-mkt vol → crowded open)
+            if vol > INTRADAY_VOL_MAX:
+                fails.append(f"vol {vol/1e6:.0f}M>{INTRADAY_VOL_MAX/1e6:.0f}M (tape crowding)")
 
             if fails:
                 log("DEBUG", f"  SKIP {sym}: {' | '.join(fails)}")
@@ -1328,6 +1368,14 @@ def scan_premarket(b_mode=False):
             if not share_float:
                 log("INFO", f"  WARN {sym}: float unknown — including anyway "
                             f"(verify manually)")
+
+            # ── SSR check (A-mode only) ───────────────────────────────────────
+            # Reg SHO circuit breaker indicates the stock fell 10%+ recently.
+            # Ross (Mar 31): sellers stack the ask on SSR stocks, suppressing breakouts.
+            # B-mode may still trade SSR stocks (looser criteria, lower conviction required).
+            if not b_mode and is_on_ssr(sym):
+                log("INFO", f"  SKIP {sym}: SSR active — Reg SHO circuit breaker (skip in A-mode)")
+                continue
 
             # ── Catalyst check ────────────────────────────────────────────────
             # Always a SOFT WARNING in the scanner — watchlist should cast the
@@ -1423,10 +1471,24 @@ class State:
         self.eh_active_stops    = {}       # order_id -> stop info for software stops
         self.pm_last_scan       = 0.0      # unix ts of last premarket scan (7:00+ AM)
         self.pm_empty_notified  = False    # already sent "no candidates" message?
-        self.eh_last_late_scan  = 0.0      # unix ts of last late-session re-scan
+        self.eh_last_late_scan    = 0.0    # unix ts of last late-session re-scan
+        self.consecutive_red_days = 0      # red day streak counter; ≥2 activates 0.5× drawdown sizing
 
     def new_day(self, d):
         log("INFO", f"=== NEW DAY: {d} — state reset ===")
+        # Update red-day streak BEFORE resetting pnl so we capture yesterday's result.
+        # Guard: self.date == "" on first startup — pnl=0.0 from __init__, NOT real data.
+        # In that case, consecutive_red_days was already restored from STATUS_FILE by
+        # startup(); leave it untouched so we don't wipe a persisted streak on restart.
+        if self.date:
+            if self.pnl < 0:
+                self.consecutive_red_days += 1
+                log("INFO", f"  Consecutive red days: {self.consecutive_red_days}"
+                            + (" — drawdown sizing ACTIVE (0.5×)" if self.consecutive_red_days >= 2 else ""))
+            else:
+                if self.consecutive_red_days:
+                    log("INFO", f"  Red streak reset (was {self.consecutive_red_days} days)")
+                self.consecutive_red_days = 0
         self.watchlist       = []
         self.premarket_highs = {}
         self.traded_today    = set()
@@ -1468,7 +1530,8 @@ class State:
                     "stopped":       self.stopped,
                     "b_mode":        self.b_mode,
                     "started":       self.start_time,
-                    "be_moved":      list(self.be_moved),
+                    "be_moved":             list(self.be_moved),
+                    "consecutive_red_days": self.consecutive_red_days,
                 }, f, indent=2)
         except Exception:
             pass
@@ -1510,6 +1573,8 @@ def handle_cmd(text, cid):
             f"Halted:  {d.get('halted',False)}\n"
             f"Stopped: {d.get('stopped',False)}\n"
             f"Core cold halt: {S.core_cold_halted}\n"
+            f"Red streak: {d.get('consecutive_red_days',0)}d"
+            + (" — drawdown sizing ACTIVE (0.5×)" if d.get('consecutive_red_days',0) >= 2 else "") + "\n"
             f"Dry-run: {'🔵 ON' if DRY_RUN else '🟢 OFF'}\n"
             f"Extended hours: {'🌙 ON' if EXTENDED_HOURS else '⚪ OFF'}"
             + (f"\n  EH trades: {S.eh_trade_count}/{EH_MAX_TRADES}"
@@ -1793,6 +1858,11 @@ def startup():
         if restored:
             S.be_moved = set(restored)
             log("INFO", f"Restored be_moved: {len(S.be_moved)} order(s) skipped")
+        crd = int(saved.get("consecutive_red_days", 0))
+        if crd:
+            S.consecutive_red_days = crd
+            log("INFO", f"Restored consecutive_red_days={crd}"
+                        + (" — drawdown sizing ACTIVE (0.5×)" if crd >= 2 else ""))
     except Exception:
         pass
 
@@ -2124,16 +2194,22 @@ def cycle():
                 continue
 
             # Position size (quarter until cushion, full after)
+            # Drawdown protection: 0.5× multiplier when on a 2+ day red streak
+            # Ross (Apr 7): "size down until you've made back ~50% of the loss"
             effective_equity = S.equity
-            risk_dollars     = effective_equity * RISK_PCT
+            drawdown_mult    = 0.5 if S.consecutive_red_days >= 2 else 1.0
+            risk_dollars     = effective_equity * RISK_PCT * drawdown_mult
             if not S.cushion_built:
                 risk_dollars *= 0.25  # quarter size
                 size_label    = "quarter (building cushion)"
+                if drawdown_mult < 1.0:
+                    size_label += f" +drawdown({S.consecutive_red_days}d)"
             elif protecting_gains:
                 risk_dollars *= 0.50  # half size to protect green day
                 size_label    = "half (protecting gains)"
             else:
-                size_label    = "full"
+                size_label = ("full" if drawdown_mult == 1.0
+                              else f"half (drawdown — {S.consecutive_red_days}d red streak)")
 
             qty = int(risk_dollars / sig["risk"]) if sig["risk"] > 0 else 0
             max_qty = int(effective_equity * 0.25 / sig["entry"])
@@ -2392,17 +2468,21 @@ def cycle():
                     log("INFO", f"  [{sym}] EH SKIP: no catalyst (A-quality requires news)")
                     continue
 
-                # Half position sizing for EH trades
+                # Half position sizing for EH trades + drawdown protection
                 effective_equity = S.equity
-                risk_dollars = effective_equity * RISK_PCT * EH_SIZE_MULT
+                drawdown_mult    = 0.5 if S.consecutive_red_days >= 2 else 1.0
+                risk_dollars     = effective_equity * RISK_PCT * EH_SIZE_MULT * drawdown_mult
                 if not S.cushion_built:
                     risk_dollars *= 0.25
                     size_label = f"EH quarter (building cushion, {EH_SIZE_MULT:.0%}x)"
+                    if drawdown_mult < 1.0:
+                        size_label += f" +drawdown({S.consecutive_red_days}d)"
                 elif S.pnl >= DAILY_TARGET:
                     risk_dollars *= 0.50
                     size_label = f"EH half (protecting gains, {EH_SIZE_MULT:.0%}x)"
                 else:
-                    size_label = f"EH half ({EH_SIZE_MULT:.0%}x base)"
+                    size_label = (f"EH half ({EH_SIZE_MULT:.0%}x base)" if drawdown_mult == 1.0
+                                  else f"EH quarter ({EH_SIZE_MULT:.0%}× × drawdown {S.consecutive_red_days}d)")
 
                 qty = int(risk_dollars / sig["risk"]) if sig["risk"] > 0 else 0
                 max_qty = int(effective_equity * 0.25 / sig["entry"])
@@ -2565,20 +2645,22 @@ def cycle():
                     log("INFO", f"  [{sym}] EH SKIP: no catalyst (A-quality requires news)")
                     continue
 
-                # Half position sizing for EH trades
+                # Half position sizing for EH trades + drawdown protection
                 effective_equity = S.equity
-                risk_dollars = effective_equity * RISK_PCT
-                # Apply EH half-size multiplier
-                risk_dollars *= EH_SIZE_MULT
+                drawdown_mult    = 0.5 if S.consecutive_red_days >= 2 else 1.0
+                risk_dollars     = effective_equity * RISK_PCT * EH_SIZE_MULT * drawdown_mult
                 # Further reduce if no cushion
                 if not S.cushion_built:
                     risk_dollars *= 0.25
                     size_label = f"EH quarter (building cushion, {EH_SIZE_MULT:.0%}×)"
+                    if drawdown_mult < 1.0:
+                        size_label += f" +drawdown({S.consecutive_red_days}d)"
                 elif S.pnl >= DAILY_TARGET:
                     risk_dollars *= 0.50
                     size_label = f"EH half (protecting gains, {EH_SIZE_MULT:.0%}×)"
                 else:
-                    size_label = f"EH half ({EH_SIZE_MULT:.0%}× base)"
+                    size_label = (f"EH half ({EH_SIZE_MULT:.0%}× base)" if drawdown_mult == 1.0
+                                  else f"EH quarter ({EH_SIZE_MULT:.0%}× × drawdown {S.consecutive_red_days}d)")
 
                 qty = int(risk_dollars / sig["risk"]) if sig["risk"] > 0 else 0
                 max_qty = int(effective_equity * 0.25 / sig["entry"])
@@ -2776,6 +2858,9 @@ def cycle():
             f"Trades: {S.trade_count} | P&L: ${S.pnl:+.2f}\n"
             f"Equity: ${S.equity:,.2f}\n"
             f"Candidates today: {len(S.watchlist)}"
+            + (f"\nRed streak: {S.consecutive_red_days}d — drawdown sizing ACTIVE (0.5×)"
+               if S.consecutive_red_days >= 2 else
+               (f"\nRed streak: {S.consecutive_red_days}d" if S.consecutive_red_days else ""))
             + eh_line
             + trade_lines)
 

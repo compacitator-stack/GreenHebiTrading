@@ -230,7 +230,7 @@ def get_quote(sym):
     url = (f"https://data.alpaca.markets/v2/stocks/{sym}"
            f"/quotes/latest?feed=iex")
     resp = GET(url, h=alp_h())
-    if not resp or "quote" not in resp:
+    if not resp or not resp.get("quote"):
         return None, None
     q   = resp["quote"]
     bid = float(q.get("bp", 0) or 0)
@@ -367,7 +367,7 @@ def get_1min_bars(sym, limit=60):
     url = (f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
            f"?timeframe=1Min&limit={limit}&feed=iex&adjustment=raw")
     resp = GET(url, h=alp_h())
-    if not resp or "bars" not in resp:
+    if not resp or not resp.get("bars"):
         return []
     return resp["bars"]  # [{t, o, h, l, c, v, vw, n}, ...]
 
@@ -502,10 +502,13 @@ def ws_subscribe(symbols):
         url = (f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
                f"?timeframe=1Min&limit=60&feed=iex&adjustment=raw")
         resp = GET(url, h=alp_h())
-        if resp and "bars" in resp:
+        if resp and resp.get("bars"):
             with _bar_lock:
                 _bar_cache[sym] = resp["bars"][-60:]
             log("DEBUG", f"Polygon WS: seeded {len(resp['bars'])} bars for {sym}")
+        else:
+            log("WARN", f"Polygon WS: no REST bars to seed for {sym} "
+                        f"— will subscribe anyway, bars will stream live")
 
     # Subscribe on the live WS connection (if auth is complete)
     if _polygon_ws and _ws_auth_ok:

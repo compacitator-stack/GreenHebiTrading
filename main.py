@@ -121,6 +121,11 @@ INTRADAY_VOL_MAX = 25_000_000  # Ross (Apr 1): above ~25-30M intraday shares the
                                # (scalpers create 1-cent-spread crowding — impossible to read trend)
                                # Also caught SKYQ (90M shares, Apr 2) as a second filter
 
+# Broad market catalyst detection — bypasses A-quality catalyst gate on
+# macro-driven days (e.g. geopolitical peace deal, Fed surprise, major data).
+# Ross himself trades these: "the catalyst is the market."
+MACRO_CATALYST_GAP_PCT = 1.5  # SPY gap ≥1.5% = broad market catalyst day
+
 # B-mode (looser criteria, only if no A-quality by 10:00 ET, max 1 trade)
 B_GAP_MIN      = 2.0
 B_RVOL_MIN     = 4.0
@@ -366,13 +371,23 @@ def get_1min_bars(sym, limit=60):
         cached = list(_bar_cache.get(sym, []))
     if cached:
         return cached[-limit:]
-    # REST fallback — used until WS is connected and cache seeded
+    # REST fallback — used until WS is connected and cache seeded.
+    # Try Alpaca IEX first; fall back to Polygon REST for micro-caps/OTC
+    # symbols with low IEX routing coverage.
     url = (f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
            f"?timeframe=1Min&limit={limit}&feed=iex&adjustment=raw")
     resp = GET(url, h=alp_h())
-    if not resp or "bars" not in resp:
-        return []
-    return resp["bars"]  # [{t, o, h, l, c, v, vw, n}, ...]
+    if resp and resp.get("bars"):
+        return resp["bars"]
+    # Polygon REST fallback — full SIP coverage including OTC/micro-caps
+    today = now_et().date().isoformat()
+    url2 = (f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/minute/"
+            f"{today}/{today}?adjusted=false&sort=asc&limit=120"
+            f"&apiKey={POLYGON_KEY}")
+    resp2 = GET(url2)
+    if resp2 and resp2.get("results"):
+        return [_normalize_polygon_agg(r) for r in resp2["results"][-limit:]]
+    return []
 
 
 # ── Polygon WebSocket — real-time 1-min bar streaming ─────────────────────────
@@ -402,6 +417,24 @@ def _normalize_polygon_bar(e):
         "v":  int(  e.get("v",  0)),
         "vw": float(e.get("vw", 0)),
         "n":  int(  e.get("z",  0)),
+    }
+
+
+def _normalize_polygon_agg(r):
+    """Convert Polygon REST /v2/aggs result dict to Alpaca bar format.
+    REST aggs use 't' (ms Unix) for timestamp vs WS events which use 's'."""
+    ts = datetime.fromtimestamp(
+        r["t"] / 1000, tz=timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "t":  ts,
+        "o":  float(r.get("o",  0)),
+        "h":  float(r.get("h",  0)),
+        "l":  float(r.get("l",  0)),
+        "c":  float(r.get("c",  0)),
+        "v":  int(  r.get("v",  0)),
+        "vw": float(r.get("vw", 0)),
+        "n":  int(  r.get("n",  0)),
     }
 
 
@@ -501,14 +534,32 @@ def ws_subscribe(symbols):
 
     # Seed bar cache from REST for each new symbol so detect_flag()
     # has history immediately (WS only streams bars going forward).
+    # Try Alpaca IEX first; fall back to Polygon REST for micro-caps/OTC
+    # symbols with low IEX routing coverage.
     for sym in new_syms:
         url = (f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
                f"?timeframe=1Min&limit=60&feed=iex&adjustment=raw")
         resp = GET(url, h=alp_h())
-        if resp and "bars" in resp:
+        if resp and resp.get("bars"):
             with _bar_lock:
                 _bar_cache[sym] = resp["bars"][-60:]
-            log("DEBUG", f"Polygon WS: seeded {len(resp['bars'])} bars for {sym}")
+            log("DEBUG", f"Polygon WS: seeded {len(resp['bars'])} bars for {sym} (IEX)")
+        else:
+            # Polygon REST fallback — full SIP coverage for OTC/micro-caps
+            today = now_et().date().isoformat()
+            url2 = (f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/minute/"
+                    f"{today}/{today}?adjusted=false&sort=asc&limit=120"
+                    f"&apiKey={POLYGON_KEY}")
+            resp2 = GET(url2)
+            if resp2 and resp2.get("results"):
+                bars = [_normalize_polygon_agg(r) for r in resp2["results"][-60:]]
+                with _bar_lock:
+                    _bar_cache[sym] = bars
+                log("DEBUG", f"Polygon WS: seeded {len(bars)} bars for {sym} "
+                             f"(Polygon REST fallback)")
+            else:
+                log("WARN", f"Polygon WS: no seed bars for {sym} "
+                            f"(IEX + Polygon both empty)")
 
     # Subscribe on the live WS connection (if auth is complete)
     if _polygon_ws and _ws_auth_ok:
@@ -950,6 +1001,43 @@ def calc_tod_rvol(today_vol, prev_day_vol, minutes_traded):
         return 0.0
     return today_vol / expected_vol
 
+# ── Broad market catalyst detection ──────────────────────────────────────────
+# On macro-driven days (geopolitical events, Fed surprises), individual stocks
+# gap up without stock-specific news. The catalyst IS the market itself.
+# This checks SPY's gap to detect these days and relaxes the catalyst gate.
+_macro_catalyst_cache: dict = {"date": "", "is_macro": False, "spy_gap": 0.0}
+
+def check_macro_catalyst():
+    """Check if SPY gapped up enough to qualify as a broad market catalyst day.
+    Cached per calendar day — only one Polygon call per day."""
+    global _macro_catalyst_cache
+    today = now_et().strftime("%Y-%m-%d")
+    if _macro_catalyst_cache["date"] == today:
+        return _macro_catalyst_cache["is_macro"], _macro_catalyst_cache["spy_gap"]
+    try:
+        url = (f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/SPY"
+               f"?apiKey={POLYGON_KEY}")
+        data = GET(url)
+        if data and data.get("ticker"):
+            t = data["ticker"]
+            prev_close = float(t.get("prevDay", {}).get("c", 0) or 0)
+            current    = float(t.get("day", {}).get("c", 0) or 0)
+            if current == 0:
+                current = float(t.get("lastTrade", {}).get("p", 0) or 0)
+            if prev_close > 0 and current > 0:
+                spy_gap = ((current - prev_close) / prev_close) * 100
+                is_macro = spy_gap >= MACRO_CATALYST_GAP_PCT
+                _macro_catalyst_cache = {"date": today, "is_macro": is_macro, "spy_gap": spy_gap}
+                if is_macro:
+                    log("INFO", f"Broad market catalyst detected: SPY gap {spy_gap:+.1f}% "
+                                f"(threshold {MACRO_CATALYST_GAP_PCT}%)")
+                return is_macro, spy_gap
+    except Exception as e:
+        log("DEBUG", f"Macro catalyst check failed (non-fatal): {e}")
+    _macro_catalyst_cache = {"date": today, "is_macro": False, "spy_gap": 0.0}
+    return False, 0.0
+
+
 # ── SSR (Reg SHO circuit breaker) ────────────────────────────────────────────
 # When a stock falls 10%+ from its previous close the SEC's Reg SHO circuit
 # breaker activates for the remainder of that day and the next trading day.
@@ -1167,10 +1255,19 @@ def detect_flag(sym, premarket_high=None, session="core"):
                 if flag_low < vwap_at_flag * 0.997:
                     continue
 
-                # Pre-market high check: flag holding near/above PMH is stronger
+                # Pre-market high check: only enforce PMH as a FLOOR when current
+                # price is at or above PMH (i.e. the stock has already reclaimed it).
+                # When current price < PMH, PMH is a TARGET above us — requiring
+                # the flag to hold within 2% of an untouched level makes no sense
+                # and blocked every setup on big-gap open days (e.g. BBGI PMH $7.55
+                # trading $5-6, ELPW PMH $2.92 open $2.71 — never at PMH post-open).
                 if premarket_high and premarket_high > 0:
-                    if flag_low < premarket_high * 0.98:
-                        continue  # failed to hold PMH support
+                    if current_price >= premarket_high:
+                        # Price has reclaimed/exceeded PMH — flag must hold PMH as support
+                        if flag_low < premarket_high * 0.98:
+                            log("INFO", f"  [{sym}] SKIP: flag_low ${flag_low:.2f} "
+                                        f"below PMH support ${premarket_high*0.98:.2f}")
+                            continue
 
                 # ── Breakout signal: bar AFTER flag makes new high ────────────
                 # Ross: "first candle to make a new high — that's when you buy"
@@ -1416,7 +1513,7 @@ def scan_premarket(b_mode=False):
             continue
 
     results.sort(key=lambda x: x["gap"], reverse=True)
-    results = results[:5]
+    results = results[:8]
     log("INFO", f"=== SCAN DONE: {len(results)} candidates ===")
     return results
 
@@ -1966,10 +2063,14 @@ def cycle():
                     f"    {'📰' if w.get('has_news') else '⚠️'} "
                     f"{w.get('catalyst','')[:60]}")
 
+            is_macro, spy_gap = check_macro_catalyst()
+            macro_line = (f"\n🌍 Broad market catalyst: SPY {spy_gap:+.1f}% "
+                          f"— news gate relaxed" if is_macro else "")
             tg_send(
                 f"🔍 *PRE-MARKET SCAN"
                 f"{' (B-MODE)' if S.b_mode else ''}*\n"
                 + "\n".join(lines)
+                + macro_line
                 + f"\n\nMonitoring from 9:35 ET\n"
                 f"Equity: ${S.equity:,.2f} | "
                 f"Quarter size: ${S.equity*RISK_PCT*0.25:.0f}/trade")
@@ -2189,9 +2290,15 @@ def cycle():
             # ── A-quality catalyst gate (enforced at trade time, not scan time) ─
             # Ross: "my best trades are when the catalyst is obvious"
             # Ross: "there must be a headline that justifies why the stock is moving"
-            if not S.b_mode and not w.get("has_news"):
+            # Exception: on broad market catalyst days (SPY gap ≥1.5%), the market
+            # itself IS the catalyst — bypass the stock-specific news requirement.
+            is_macro, spy_gap = check_macro_catalyst()
+            if not S.b_mode and not w.get("has_news") and not is_macro:
                 log("INFO", f"  [{sym}] SKIP: no catalyst (A-quality requires news)")
                 continue
+            if is_macro and not w.get("has_news"):
+                log("INFO", f"  [{sym}] Catalyst gate bypassed — broad market day "
+                            f"(SPY {spy_gap:+.1f}%)")
 
             # Position size (quarter until cushion, full after)
             # Drawdown protection: 0.5× multiplier when on a 2+ day red streak
@@ -2464,9 +2571,13 @@ def cycle():
                         continue
 
                 # A-quality catalyst gate at trade time
-                if not S.b_mode and not w.get("has_news"):
+                is_macro, spy_gap = check_macro_catalyst()
+                if not S.b_mode and not w.get("has_news") and not is_macro:
                     log("INFO", f"  [{sym}] EH SKIP: no catalyst (A-quality requires news)")
                     continue
+                if is_macro and not w.get("has_news"):
+                    log("INFO", f"  [{sym}] EH: catalyst gate bypassed — broad market day "
+                                f"(SPY {spy_gap:+.1f}%)")
 
                 # Half position sizing for EH trades + drawdown protection
                 effective_equity = S.equity
@@ -2641,9 +2752,13 @@ def cycle():
                         continue
 
                 # A-quality catalyst gate at trade time
-                if not S.b_mode and not w.get("has_news"):
+                is_macro, spy_gap = check_macro_catalyst()
+                if not S.b_mode and not w.get("has_news") and not is_macro:
                     log("INFO", f"  [{sym}] EH SKIP: no catalyst (A-quality requires news)")
                     continue
+                if is_macro and not w.get("has_news"):
+                    log("INFO", f"  [{sym}] EH: catalyst gate bypassed — broad market day "
+                                f"(SPY {spy_gap:+.1f}%)")
 
                 # Half position sizing for EH trades + drawdown protection
                 effective_equity = S.equity

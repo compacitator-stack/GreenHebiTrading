@@ -1284,9 +1284,12 @@ def detect_flag(sym, premarket_high=None, session="core"):
                 breakout_bar = None
                 for ci in range(fe, min(fe + 3, len(window))):
                     if float(window[ci]["h"]) > flag_high:
-                        breakout = True
-                        breakout_bar = window[ci]
-                        break
+                        # Breakout bar must CLOSE above flag_high — a wick
+                        # above that closes back below is a failed breakout.
+                        if float(window[ci]["c"]) >= flag_high:
+                            breakout = True
+                            breakout_bar = window[ci]
+                            break
                 if not breakout:
                     continue
 
@@ -2300,6 +2303,14 @@ def cycle():
                     log("INFO", f"  [{sym}] SKIP: price ${live_price:.2f} already above "
                                 f"entry ${sig['entry']:.2f} — limit would fill on pullback only")
                     continue
+                elif live_price < sig["entry"] - (2.0 * sig["risk"]):
+                    # Price has fallen well below entry — the breakout failed
+                    # and the setup is dead. Stop-limit would sit unfilled.
+                    log("INFO", f"  [{sym}] SKIP: price ${live_price:.2f} fell "
+                                f"below entry ${sig['entry']:.2f} - 2×risk "
+                                f"(${sig['entry'] - 2.0 * sig['risk']:.2f}) — "
+                                f"breakout failed")
+                    continue
 
             # ── A-quality catalyst gate (enforced at trade time, not scan time) ─
             # Ross: "my best trades are when the catalyst is obvious"
@@ -2583,6 +2594,12 @@ def cycle():
                         log("INFO", f"  [{sym}] EH SKIP: price ${live_price:.2f} already above "
                                     f"entry ${sig['entry']:.2f} — limit would fill on pullback only")
                         continue
+                    elif live_price < sig["entry"] - (2.0 * sig["risk"]):
+                        log("INFO", f"  [{sym}] EH SKIP: price ${live_price:.2f} fell "
+                                    f"below entry ${sig['entry']:.2f} - 2×risk "
+                                    f"(${sig['entry'] - 2.0 * sig['risk']:.2f}) — "
+                                    f"breakout failed")
+                        continue
 
                 # A-quality catalyst gate at trade time
                 is_macro, spy_gap = check_macro_catalyst()
@@ -2764,6 +2781,12 @@ def cycle():
                         log("INFO", f"  [{sym}] EH SKIP: price ${live_price:.2f} already above "
                                     f"entry ${sig['entry']:.2f} — limit would fill on pullback only")
                         continue
+                    elif live_price < sig["entry"] - (2.0 * sig["risk"]):
+                        log("INFO", f"  [{sym}] EH SKIP: price ${live_price:.2f} fell "
+                                    f"below entry ${sig['entry']:.2f} - 2×risk "
+                                    f"(${sig['entry'] - 2.0 * sig['risk']:.2f}) — "
+                                    f"breakout failed")
+                        continue
 
                 # A-quality catalyst gate at trade time
                 is_macro, spy_gap = check_macro_catalyst()
@@ -2773,6 +2796,26 @@ def cycle():
                 if is_macro and not w.get("has_news"):
                     log("INFO", f"  [{sym}] EH: catalyst gate bypassed — broad market day "
                                 f"(SPY {spy_gap:+.1f}%)")
+
+                # ── Spread check (same as core session) ─────────────────────────
+                bid, ask = get_quote(sym)
+                live_ask = ask
+                if bid and ask:
+                    spread     = ask - bid
+                    spread_pct = (spread / ask) * 100
+                    if spread_pct > MAX_SPREAD_PCT:
+                        log("INFO", f"  [{sym}] EH SKIP: spread ${spread:.2f} "
+                                    f"({spread_pct:.1f}%) > {MAX_SPREAD_PCT}% — "
+                                    f"bid ${bid:.2f} ask ${ask:.2f}")
+                        tg_send(f"⚠️ *{sym}* EH skipped — spread ${spread:.2f} "
+                                f"({spread_pct:.1f}%) too wide\n"
+                                f"bid ${bid:.2f} | ask ${ask:.2f}")
+                        continue
+                    log("DEBUG", f"  [{sym}] EH Spread OK: ${spread:.2f} "
+                                 f"({spread_pct:.1f}%) | bid ${bid:.2f} ask ${ask:.2f}")
+                else:
+                    log("DEBUG", f"  [{sym}] EH Quote unavailable — proceeding without spread check")
+                    live_ask = None
 
                 # Half position sizing for EH trades + drawdown protection
                 effective_equity = S.equity
@@ -2798,6 +2841,8 @@ def cycle():
 
                 target_type = "HOD retest" if sig.get("target_is_hod") else "measured move"
 
+                spread_line = (f"\nSpread: ${ask-bid:.2f} ({(ask-bid)/ask*100:.1f}%)"
+                               if bid and ask else "")
                 tg_send(
                     f"🌙 *EH BULL FLAG [{'B-MODE' if S.b_mode else 'A-QUALITY'}]: {sym}*\n"
                     f"Session: LATE ({t.strftime('%H:%M ET')})\n"
@@ -2809,13 +2854,14 @@ def cycle():
                     f"Shares: {qty}  | Size: {size_label}\n"
                     f"Total risk: ${qty * sig['risk']:.0f}\n"
                     f"─────────────────\n"
-                    f"Pattern: {sig['total_candles']} candles\n"
-                    f"✅ Regular hours — bracket order with broker-side stop")
+                    f"Pattern: {sig['total_candles']} candles"
+                    + spread_line +
+                    f"\n✅ Regular hours — bracket order with broker-side stop")
 
                 # Late session is during regular market hours (11:01-15:30)
                 # so we use standard bracket orders — NOT place_eh_order.
                 # Bracket orders provide broker-side stop-loss protection.
-                r = place_bracket(sym, qty, sig["entry"], sig["stop"], sig["target"])
+                r = place_bracket(sym, qty, sig["entry"], sig["stop"], sig["target"], ask=live_ask)
 
                 if r and r.get("id"):
                     S.eh_traded_today.add(sym)

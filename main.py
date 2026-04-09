@@ -64,7 +64,7 @@ ALPACA_KEY   = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SEC   = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 TG_TOKEN     = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT      = os.environ.get("TELEGRAM_CHAT_ID", "")
+TG_CHAT      = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 SHEETS_URL   = os.environ.get("SHEETS_WEBHOOK_URL", "")  # Google Apps Script webhook
 DASH_TOKEN   = os.environ.get("DASHBOARD_TOKEN",    "")  # protects /api/dashboard & /api/log
 DRY_RUN      = os.environ.get("DRY_RUN", "").lower() in ("1","true","yes")  # set DRY_RUN=true to simulate without placing orders
@@ -401,6 +401,10 @@ _bar_lock    = threading.Lock()
 _ws_subscribed = set()       # symbols currently subscribed on WS
 _ws_auth_ok  = False         # True once Polygon auth handshake completes
 _polygon_ws  = None          # active WebSocketApp instance
+_ws_backoff    = 5           # current reconnect delay (exponential backoff)
+_ws_policy_fails = 0         # consecutive 1008 (policy violation) closes
+_ws_rest_only  = False       # True = gave up on WS, use REST only
+_ws_last_error_str = ""      # stash error string so on_close can inspect it
 
 
 def _normalize_polygon_bar(e):
@@ -444,7 +448,7 @@ def _on_ws_open(ws):
 
 
 def _on_ws_message(ws, message):
-    global _ws_auth_ok
+    global _ws_auth_ok, _ws_backoff
     try:
         events = json.loads(message)
     except Exception:
@@ -455,6 +459,7 @@ def _on_ws_message(ws, message):
 
         if ev == "status" and status == "auth_success":
             _ws_auth_ok = True
+            _ws_backoff = 5    # reset backoff on successful auth
             log("INFO", "Polygon WS: authenticated")
             # Re-subscribe any symbols already in the subscribed set
             # (handles reconnection mid-session)
@@ -486,27 +491,48 @@ def _on_ws_message(ws, message):
 
 
 def _on_ws_error(ws, error):
-    log("WARN", f"Polygon WS error: {error}")
+    global _ws_last_error_str
+    err_str = str(error)
+    _ws_last_error_str = err_str
+    if "opcode=8" in err_str and "\\x03\\xf0" in err_str:
+        log("WARN", "Polygon WS error: close frame received (code 1008 — Policy Violation)")
+    else:
+        log("WARN", f"Polygon WS error: {error}")
 
 
 def _on_ws_close(ws, code, msg):
-    global _ws_auth_ok
+    global _ws_auth_ok, _ws_policy_fails
     _ws_auth_ok = False
-    log("INFO", f"Polygon WS closed (code={code}) — will reconnect")
+    is_policy = (code == 1008
+                 or (code is None and "\\x03\\xf0" in _ws_last_error_str))
+    if is_policy:
+        _ws_policy_fails += 1
+        log("WARN", f"Polygon WS closed (code=1008 Policy Violation) — "
+                     f"attempt {_ws_policy_fails}/5")
+    else:
+        _ws_policy_fails = 0
+        log("INFO", f"Polygon WS closed (code={code}) — will reconnect")
 
 
 def start_polygon_ws():
     """
     Open Polygon WebSocket in a daemon thread. Reconnects automatically
-    on disconnect with a 5-second back-off.
-    Subscription: AM.* (real-time minute aggregate bars).
+    with exponential back-off. Gives up after 5 consecutive policy-violation
+    closes (free-tier Polygon does not support real-time WS).
     """
-    global _polygon_ws
+    global _polygon_ws, _ws_backoff, _ws_rest_only
     if not _WS_AVAILABLE:
         log("WARN", "websocket-client not installed — WS streaming disabled. "
                     "Run: pip install websocket-client")
         return
     while True:
+        if _ws_policy_fails >= 5:
+            _ws_rest_only = True
+            _polygon_ws = None
+            log("WARN", "Polygon WS: 5 consecutive 1008 (Policy Violation) closes — "
+                        "your Polygon plan likely does not support real-time WebSocket. "
+                        "Falling back to REST-only bar data.")
+            return
         try:
             _polygon_ws = _websocket_lib.WebSocketApp(
                 "wss://socket.polygon.io/stocks",
@@ -518,7 +544,8 @@ def start_polygon_ws():
             _polygon_ws.run_forever(ping_interval=30, ping_timeout=10)
         except Exception as e:
             log("WARN", f"Polygon WS thread error: {e}")
-        time.sleep(5)   # back-off before reconnect
+        time.sleep(_ws_backoff)
+        _ws_backoff = min(_ws_backoff * 2, 60)
 
 
 def ws_subscribe(symbols):
@@ -3205,14 +3232,17 @@ def main():
 
     startup()
 
-    # Start Polygon WebSocket for real-time 1-min bar streaming
-    t_ws = threading.Thread(target=start_polygon_ws, daemon=True)
-    t_ws.start()
+    # Polygon WebSocket — disabled: free-tier Polygon does not support real-time WS.
+    # Bar data falls back to Alpaca IEX REST → Polygon REST automatically.
+    # To re-enable: upgrade Polygon plan and uncomment:
+    # t_ws = threading.Thread(target=start_polygon_ws, daemon=True)
+    # t_ws.start()
+    log("INFO", "Polygon WS: disabled (free-tier plan — using REST fallback for bar data)")
 
     # Start trading cycle on its own thread — decoupled from Telegram
     t_cycle = threading.Thread(target=_cycle_loop, daemon=True)
     t_cycle.start()
-    log("INFO", "Main loop active — cycle: 8s thread | Polygon WS: live bars | Telegram: long-poll 25s")
+    log("INFO", "Main loop active — cycle: 8s thread | Telegram: long-poll 25s")
 
     # Main thread: Telegram commands only
     while True:

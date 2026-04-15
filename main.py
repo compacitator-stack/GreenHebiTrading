@@ -121,6 +121,30 @@ INTRADAY_VOL_MAX = 25_000_000  # Ross (Apr 1): above ~25-30M intraday shares the
                                # (scalpers create 1-cent-spread crowding — impossible to read trend)
                                # Also caught SKYQ (90M shares, Apr 2) as a second filter
 
+# Curl / 9 EMA Pullback pattern (Ross: "stock curls along the 9 EMA, higher lows, breaks out")
+# Togglable via /curl command; max 1 curl trade per day
+CURL_MODE_DEFAULT  = os.environ.get("CURL_MODE", "").lower() in ("1","true","yes")
+CURL_EMA_PERIOD    = 9         # Ross's preferred EMA for curl setups
+CURL_EMA_ZONE_PCT  = 0.005    # candle low within 0.5% of 9 EMA = "touching"
+CURL_MIN_TOUCHES   = 2        # minimum bars touching/crossing the EMA zone
+CURL_MIN_SURGE_PCT = 0.03     # prior surge must be ≥ 3% to confirm uptrend before curl
+CURL_VOL_DECLINE   = 0.70     # curl-phase avg volume < 70% of surge avg volume
+CURL_MAX_BARS      = 15       # curl consolidation can last up to 15 bars (vs 4 for flag)
+CURL_MIN_BARS      = 4        # at least 4 bars of curling (more patient than flag)
+CURL_MAX_TRADES    = 1        # max curl trades per day
+
+# Flat Top Breakout pattern (Ross: "multiple wicks tap same resistance, volume dries up, then breaks")
+# Togglable via /flattop command; max 1 flat top trade per day
+FLAT_MODE_DEFAULT   = os.environ.get("FLAT_TOP_MODE", "").lower() in ("1","true","yes")
+FLAT_RESIST_ZONE    = 0.003   # 0.3% — candle highs within this band = "same level"
+FLAT_MIN_TOUCHES    = 2       # minimum taps of resistance (2-3 per Ross)
+FLAT_MAX_TOUCHES    = 6       # cap to avoid overfitting
+FLAT_VOL_DECLINE    = 0.70    # consolidation avg volume < 70% of initial push volume
+FLAT_MIN_BARS       = 3       # minimum consolidation bars
+FLAT_MAX_BARS       = 10      # max consolidation length
+FLAT_BO_VOL_SURGE   = 1.50    # breakout candle volume must be >= 150% of consolidation avg
+FLAT_MAX_TRADES     = 1       # max flat top trades per day
+
 # Broad market catalyst detection — bypasses A-quality catalyst gate on
 # macro-driven days (e.g. geopolitical peace deal, Fed surprise, major data).
 # Ross himself trades these: "the catalyst is the market."
@@ -1377,6 +1401,481 @@ def detect_flag(sym, premarket_high=None, session="core"):
                 f"VWAP ${current_vwap:.2f})")
     return None
 
+# ── Curl / 9 EMA Pullback Detector ───────────────────────────────────────────
+def calc_ema(bars, period):
+    """Exponential Moving Average over bar close prices. Returns list aligned to bars."""
+    if not bars:
+        return []
+    closes = [float(b["c"]) for b in bars]
+    ema_vals = [closes[0]]
+    mult = 2.0 / (period + 1)
+    for i in range(1, len(closes)):
+        ema_vals.append(closes[i] * mult + ema_vals[-1] * (1 - mult))
+    return ema_vals
+
+
+def detect_curl(sym, premarket_high=None, session="core"):
+    """
+    Ross Cameron Curl / 9 EMA Pullback on 1-minute chart.
+
+    Pattern:
+    - Stock has an initial surge (≥3% move, strong uptrend above VWAP)
+    - Price pulls back and "curls" along the 9 EMA, making higher lows
+    - At least 2 candle lows touch the 9 EMA zone (within 0.5%)
+    - Volume declines during the curl phase (< 70% of surge volume)
+    - First candle to make a new high above the curl range → entry
+
+    Ross (Apr 14, ROR): traded a curl at $9.31 after 90-min grind along EMA.
+
+    Same signal dict contract as detect_flag(). Max 1 curl trade/day.
+    """
+    bars = get_1min_bars(sym, limit=60)
+    if not bars:
+        log("INFO", f"  [{sym}] CURL SKIP: no 1-min bar data")
+        return None
+
+    # Filter to today's bars only
+    today_str = now_et().date().isoformat()
+    bars = [b for b in bars if b["t"][:10] == today_str]
+
+    # Determine the bar window based on session (same logic as detect_flag)
+    if session == "early":
+        start_hour, start_min = EH_EARLY_START
+        end_hour, end_min = EH_EARLY_END
+    elif session == "late":
+        start_hour, start_min = 9, 35
+        end_hour, end_min = EH_LATE_END
+    else:
+        start_hour, start_min = 9, 35
+        end_hour, end_min = 11, 0
+
+    all_today = []
+    market_bars = []
+    vwap_start_hour = start_hour if session == "early" else 9
+    vwap_start_min  = start_min  if session == "early" else 30
+    for b in bars:
+        ts_et = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET)
+        if ts_et.hour > vwap_start_hour or (ts_et.hour == vwap_start_hour and ts_et.minute >= vwap_start_min):
+            all_today.append(b)
+        if ts_et.hour > start_hour or (ts_et.hour == start_hour and ts_et.minute >= start_min):
+            if ts_et.hour < end_hour or (ts_et.hour == end_hour and ts_et.minute <= end_min):
+                market_bars.append(b)
+
+    # Need enough bars for surge + curl + breakout
+    min_needed = 3 + CURL_MIN_BARS + 1  # surge + curl + breakout candle
+    if len(market_bars) < min_needed:
+        log("INFO", f"  [{sym}] CURL SKIP: only {len(market_bars)} bars (need ≥{min_needed})")
+        return None
+
+    # VWAP
+    vwap_all  = calc_vwap(all_today)
+    vwap_dict = {}
+    for i, b in enumerate(all_today):
+        vwap_dict[b["t"]] = vwap_all[i]
+
+    current_vwap  = vwap_dict.get(all_today[-1]["t"], float(market_bars[-1]["c"]))
+    current_price = float(market_bars[-1]["c"])
+    intraday_hod  = max(float(b["h"]) for b in all_today) if all_today else current_price
+
+    # Price must be above VWAP (same quick exit as bull flag)
+    if current_price < current_vwap * 0.995:
+        log("INFO", f"  [{sym}] CURL SKIP: price ${current_price:.2f} below VWAP ${current_vwap:.2f}")
+        return None
+
+    # 9 EMA on all market bars
+    ema_vals = calc_ema(market_bars, CURL_EMA_PERIOD)
+    if not ema_vals:
+        return None
+
+    # ── Find surge + curl pattern ────────────────────────────────────────────
+    # Slide through bars looking for: surge phase → curl phase → breakout
+    best = None
+
+    for surge_start in range(len(market_bars) - min_needed):
+        # Try different surge end points (surge = strong initial move up)
+        for surge_end in range(surge_start + 3, min(surge_start + 12, len(market_bars) - CURL_MIN_BARS)):
+            surge = market_bars[surge_start:surge_end]
+            surge_low  = float(surge[0]["l"])
+            surge_high = max(float(b["h"]) for b in surge)
+            surge_move = (surge_high - surge_low) / surge_low if surge_low > 0 else 0
+
+            # Surge must be ≥ CURL_MIN_SURGE_PCT (3% default)
+            if surge_move < CURL_MIN_SURGE_PCT:
+                continue
+
+            # Surge must be mostly green (≥60%)
+            green = sum(1 for b in surge if float(b["c"]) > float(b["o"]))
+            if green < len(surge) * 0.6:
+                continue
+
+            surge_avg_vol = sum(float(b["v"]) for b in surge) / len(surge)
+
+            # ── Curl phase: bars after surge that ride the 9 EMA ─────────────
+            for curl_len in range(CURL_MIN_BARS, min(CURL_MAX_BARS + 1, len(market_bars) - surge_end)):
+                curl_start = surge_end
+                curl_end   = curl_start + curl_len
+                if curl_end >= len(market_bars):
+                    break
+
+                curl = market_bars[curl_start:curl_end]
+                curl_emas = ema_vals[curl_start:curl_end]
+
+                # Count EMA touches: candle low within CURL_EMA_ZONE_PCT of 9 EMA
+                touches = 0
+                for ci, cb in enumerate(curl):
+                    ema_val = curl_emas[ci]
+                    bar_low = float(cb["l"])
+                    # "Touching" = low is within the EMA zone (above or just below)
+                    if ema_val > 0 and abs(bar_low - ema_val) / ema_val <= CURL_EMA_ZONE_PCT:
+                        touches += 1
+
+                if touches < CURL_MIN_TOUCHES:
+                    continue
+
+                # Higher lows check: at least the last 2 lows should be ascending
+                curl_lows = [float(cb["l"]) for cb in curl]
+                higher_lows = sum(1 for i in range(1, len(curl_lows))
+                                  if curl_lows[i] >= curl_lows[i-1] - 0.02)
+                if higher_lows < len(curl_lows) * 0.5:
+                    continue
+
+                # Volume decline during curl
+                curl_avg_vol = sum(float(cb["v"]) for cb in curl) / len(curl)
+                if surge_avg_vol > 0 and curl_avg_vol >= surge_avg_vol * CURL_VOL_DECLINE:
+                    continue
+
+                # Curl must hold above VWAP
+                curl_low = min(float(cb["l"]) for cb in curl)
+                vwap_at_curl = vwap_dict.get(curl[0]["t"], current_vwap)
+                if curl_low < vwap_at_curl * 0.997:
+                    continue
+
+                # Curl must hold above 9 EMA (can't close significantly below)
+                curl_closes_below = sum(1 for ci, cb in enumerate(curl)
+                                        if float(cb["c"]) < curl_emas[ci] * 0.995)
+                if curl_closes_below > len(curl) * 0.3:
+                    continue
+
+                curl_high = max(float(cb["h"]) for cb in curl)
+
+                # ── Breakout: first bar after curl making new high ───────────
+                breakout = False
+                breakout_bar = None
+                for bi in range(curl_end, min(curl_end + 3, len(market_bars))):
+                    if float(market_bars[bi]["h"]) > curl_high:
+                        if float(market_bars[bi]["c"]) >= curl_high:
+                            breakout = True
+                            breakout_bar = market_bars[bi]
+                            break
+                if not breakout:
+                    continue
+
+                # Breakout recency check
+                try:
+                    bo_time = datetime.fromisoformat(
+                        breakout_bar["t"].replace("Z", "+00:00")).astimezone(ET)
+                    bo_age_min = (now_et() - bo_time).total_seconds() / 60
+                    if bo_age_min > BREAKOUT_MAX_AGE_MIN:
+                        log("INFO", f"  [{sym}] CURL SKIP: breakout {bo_age_min:.0f}min old")
+                        continue
+                except Exception:
+                    pass
+
+                # ── Trade levels ──────────────────────────────────────────────
+                entry = round(curl_high + 0.02, 2)
+                stop  = round(curl_low  - 0.02, 2)
+                risk  = entry - stop
+                if risk < 0.05:
+                    continue
+
+                # Target: HOD retest or measured move (surge height)
+                surge_height = surge_high - surge_low
+                if intraday_hod > entry:
+                    target = round(intraday_hod, 2)
+                else:
+                    target = round(entry + surge_height, 2)
+
+                if premarket_high and premarket_high > target:
+                    target = round(premarket_high, 2)
+
+                rr = (target - entry) / risk if risk > 0 else 0
+                if rr < MIN_RR:
+                    continue
+
+                breakeven_stop = round(entry + 0.02, 2)
+
+                candidate = {
+                    "symbol":          sym,
+                    "entry":           entry,
+                    "stop":            stop,
+                    "target":          target,
+                    "breakeven_stop":  breakeven_stop,
+                    "rr":              round(rr, 2),
+                    "risk":            round(risk, 2),
+                    "pole_height":     round(surge_height, 2),  # reuse field for surge height
+                    "retrace_pct":     round(((surge_high - curl_low) / surge_height) * 100, 1)
+                                       if surge_height > 0 else 0.0,
+                    "flag_vol_ratio":  round(curl_avg_vol / max(surge_avg_vol, 1), 2),
+                    "vwap":            round(current_vwap, 2),
+                    "hod":             round(intraday_hod, 2),
+                    "premarket_high":  premarket_high,
+                    "pole_bars":       len(surge),    # reuse: surge bar count
+                    "flag_bars":       curl_len,      # reuse: curl bar count
+                    "total_candles":   len(surge) + curl_len,
+                    "target_is_hod":   (target == round(intraday_hod, 2)),
+                    "session":         session,
+                    "pattern":         "curl",        # identifies this as a curl signal
+                    "ema_touches":     touches,
+                }
+
+                if best is None or rr > best["rr"]:
+                    best = candidate
+
+    if best:
+        s = best
+        hod_label = "HOD retest" if s["target_is_hod"] else "measured move"
+        pmh_line  = (f" | PMH ${s['premarket_high']:.2f}"
+                     if s["premarket_high"] else "")
+        log("INFO",
+            f"  [{sym}] ✅ CURL | "
+            f"E=${s['entry']} SL=${s['stop']} T=${s['target']} ({hod_label}) "
+            f"RR={s['rr']} | {s['total_candles']} candles "
+            f"(surge {s['pole_bars']} curl {s['flag_bars']}) | "
+            f"EMA touches {s['ema_touches']} vol_ratio {s['flag_vol_ratio']:.0%} | "
+            f"VWAP ${s['vwap']} HOD ${s['hod']}{pmh_line}")
+        return best
+
+    log("INFO", f"  [{sym}] NO CURL: no valid 9 EMA curl pattern "
+                f"(price ${current_price:.2f} HOD ${intraday_hod:.2f} "
+                f"VWAP ${current_vwap:.2f})")
+    return None
+
+
+# ── Flat Top Breakout Detector ────────────────────────────────────────────────
+def detect_flat_top(sym, premarket_high=None, session="core"):
+    """
+    Ross Cameron Flat Top Breakout on 1-minute chart.
+
+    Pattern:
+    - Stock pushes up, then consolidates just below a horizontal resistance level
+    - Multiple candle wicks (2-3+) tap the same price level without breaking through
+    - Volume decreases during consolidation (dry-up)
+    - Breakout above the flat resistance on a volume surge
+
+    Ross: "Third tap of a level often produces the most reliable breakout."
+
+    Same signal dict contract as detect_flag(). Max 1 flat top trade/day.
+    """
+    bars = get_1min_bars(sym, limit=60)
+    if not bars:
+        log("INFO", f"  [{sym}] FLAT SKIP: no 1-min bar data")
+        return None
+
+    today_str = now_et().date().isoformat()
+    bars = [b for b in bars if b["t"][:10] == today_str]
+
+    # Session windowing (same as detect_flag)
+    if session == "early":
+        start_hour, start_min = EH_EARLY_START
+        end_hour, end_min = EH_EARLY_END
+    elif session == "late":
+        start_hour, start_min = 9, 35
+        end_hour, end_min = EH_LATE_END
+    else:
+        start_hour, start_min = 9, 35
+        end_hour, end_min = 11, 0
+
+    all_today = []
+    market_bars = []
+    vwap_start_hour = start_hour if session == "early" else 9
+    vwap_start_min  = start_min  if session == "early" else 30
+    for b in bars:
+        ts_et = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET)
+        if ts_et.hour > vwap_start_hour or (ts_et.hour == vwap_start_hour and ts_et.minute >= vwap_start_min):
+            all_today.append(b)
+        if ts_et.hour > start_hour or (ts_et.hour == start_hour and ts_et.minute >= start_min):
+            if ts_et.hour < end_hour or (ts_et.hour == end_hour and ts_et.minute <= end_min):
+                market_bars.append(b)
+
+    min_needed = 3 + FLAT_MIN_BARS + 1  # initial push + consolidation + breakout
+    if len(market_bars) < min_needed:
+        log("INFO", f"  [{sym}] FLAT SKIP: only {len(market_bars)} bars (need ≥{min_needed})")
+        return None
+
+    # VWAP
+    vwap_all  = calc_vwap(all_today)
+    vwap_dict = {}
+    for i, b in enumerate(all_today):
+        vwap_dict[b["t"]] = vwap_all[i]
+
+    current_vwap  = vwap_dict.get(all_today[-1]["t"], float(market_bars[-1]["c"]))
+    current_price = float(market_bars[-1]["c"])
+    intraday_hod  = max(float(b["h"]) for b in all_today) if all_today else current_price
+
+    if current_price < current_vwap * 0.995:
+        log("INFO", f"  [{sym}] FLAT SKIP: price ${current_price:.2f} below VWAP ${current_vwap:.2f}")
+        return None
+
+    # ── Slide window looking for push + flat consolidation + breakout ─────────
+    window = market_bars[-25:] if len(market_bars) >= 25 else market_bars
+    best   = None
+
+    for push_start in range(len(window) - min_needed):
+        # Try different push lengths (initial move up before consolidation)
+        for push_len in range(2, min(8, len(window) - push_start - FLAT_MIN_BARS)):
+            push_end = push_start + push_len
+            push = window[push_start:push_end]
+
+            push_low  = float(push[0]["l"])
+            push_high = max(float(b["h"]) for b in push)
+            push_height = push_high - push_low
+            if push_height < POLE_MIN_MOVE:  # reuse pole min move threshold
+                continue
+
+            # Push must be mostly green
+            green = sum(1 for b in push if float(b["c"]) > float(b["o"]))
+            if green < len(push) * 0.5:
+                continue
+
+            push_avg_vol = sum(float(b["v"]) for b in push) / len(push)
+
+            # ── Flat consolidation: bars near the push_high resistance ────────
+            for consol_len in range(FLAT_MIN_BARS, min(FLAT_MAX_BARS + 1, len(window) - push_end)):
+                consol_start = push_end
+                consol_end   = consol_start + consol_len
+                if consol_end >= len(window):
+                    break
+
+                consol = window[consol_start:consol_end]
+
+                # Find the resistance zone: cluster of highs near push_high
+                consol_highs = [float(b["h"]) for b in consol]
+                resistance_level = max(consol_highs)
+
+                # Count how many candle highs tap the resistance zone
+                touches = 0
+                for ch in consol_highs:
+                    if resistance_level > 0 and abs(ch - resistance_level) / resistance_level <= FLAT_RESIST_ZONE:
+                        touches += 1
+
+                if touches < FLAT_MIN_TOUCHES or touches > FLAT_MAX_TOUCHES:
+                    continue
+
+                # The resistance must be near (within 1%) of the push high — it's a flat top
+                if push_high > 0 and abs(resistance_level - push_high) / push_high > 0.01:
+                    continue
+
+                # Volume decline during consolidation
+                consol_avg_vol = sum(float(b["v"]) for b in consol) / len(consol)
+                if push_avg_vol > 0 and consol_avg_vol >= push_avg_vol * FLAT_VOL_DECLINE:
+                    continue
+
+                # Consolidation must hold above VWAP
+                consol_low = min(float(b["l"]) for b in consol)
+                vwap_at_consol = vwap_dict.get(consol[0]["t"], current_vwap)
+                if consol_low < vwap_at_consol * 0.997:
+                    continue
+
+                # ── Breakout: candle closes above resistance with volume surge ─
+                breakout = False
+                breakout_bar = None
+                for bi in range(consol_end, min(consol_end + 3, len(window))):
+                    bo_bar = window[bi]
+                    bo_high  = float(bo_bar["h"])
+                    bo_close = float(bo_bar["c"])
+                    bo_vol   = float(bo_bar["v"])
+
+                    if bo_close > resistance_level:
+                        # Volume surge confirmation
+                        if consol_avg_vol > 0 and bo_vol >= consol_avg_vol * FLAT_BO_VOL_SURGE:
+                            breakout = True
+                            breakout_bar = bo_bar
+                            break
+                if not breakout:
+                    continue
+
+                # Breakout recency
+                try:
+                    bo_time = datetime.fromisoformat(
+                        breakout_bar["t"].replace("Z", "+00:00")).astimezone(ET)
+                    bo_age_min = (now_et() - bo_time).total_seconds() / 60
+                    if bo_age_min > BREAKOUT_MAX_AGE_MIN:
+                        log("INFO", f"  [{sym}] FLAT SKIP: breakout {bo_age_min:.0f}min old")
+                        continue
+                except Exception:
+                    pass
+
+                # ── Trade levels ──────────────────────────────────────────────
+                entry = round(resistance_level + 0.02, 2)
+                stop  = round(consol_low - 0.02, 2)
+                risk  = entry - stop
+                if risk < 0.05:
+                    continue
+
+                # Target: HOD or measured move (push height added to breakout)
+                if intraday_hod > entry:
+                    target = round(intraday_hod, 2)
+                else:
+                    target = round(entry + push_height, 2)
+
+                if premarket_high and premarket_high > target:
+                    target = round(premarket_high, 2)
+
+                rr = (target - entry) / risk if risk > 0 else 0
+                if rr < MIN_RR:
+                    continue
+
+                breakeven_stop = round(entry + 0.02, 2)
+
+                candidate = {
+                    "symbol":          sym,
+                    "entry":           entry,
+                    "stop":            stop,
+                    "target":          target,
+                    "breakeven_stop":  breakeven_stop,
+                    "rr":              round(rr, 2),
+                    "risk":            round(risk, 2),
+                    "pole_height":     round(push_height, 2),
+                    "retrace_pct":     round(((push_high - consol_low) / push_height) * 100, 1)
+                                       if push_height > 0 else 0.0,
+                    "flag_vol_ratio":  round(consol_avg_vol / max(push_avg_vol, 1), 2),
+                    "vwap":            round(current_vwap, 2),
+                    "hod":             round(intraday_hod, 2),
+                    "premarket_high":  premarket_high,
+                    "pole_bars":       push_len,
+                    "flag_bars":       consol_len,
+                    "total_candles":   push_len + consol_len,
+                    "target_is_hod":   (target == round(intraday_hod, 2)),
+                    "session":         session,
+                    "pattern":         "flat_top",
+                    "resist_touches":  touches,
+                    "resistance":      round(resistance_level, 2),
+                }
+
+                if best is None or rr > best["rr"]:
+                    best = candidate
+
+    if best:
+        s = best
+        hod_label = "HOD retest" if s["target_is_hod"] else "measured move"
+        pmh_line  = (f" | PMH ${s['premarket_high']:.2f}"
+                     if s["premarket_high"] else "")
+        log("INFO",
+            f"  [{sym}] ✅ FLAT TOP | "
+            f"E=${s['entry']} SL=${s['stop']} T=${s['target']} ({hod_label}) "
+            f"RR={s['rr']} | resist ${s['resistance']} ({s['resist_touches']} taps) | "
+            f"{s['total_candles']} candles "
+            f"(push {s['pole_bars']} consol {s['flag_bars']}) | "
+            f"vol_ratio {s['flag_vol_ratio']:.0%} | "
+            f"VWAP ${s['vwap']} HOD ${s['hod']}{pmh_line}")
+        return best
+
+    log("INFO", f"  [{sym}] NO FLAT TOP: no valid flat top pattern "
+                f"(price ${current_price:.2f} HOD ${intraday_hod:.2f} "
+                f"VWAP ${current_vwap:.2f})")
+    return None
+
+
 # ── Scanner ───────────────────────────────────────────────────────────────────
 def scan_premarket(b_mode=False):
     """
@@ -1563,6 +2062,10 @@ class State:
         self.stopped          = False  # manual /stop
         self.core_cold_halted = False  # cold market halt (core window only)
         self.b_mode           = B_MODE_DEFAULT  # from env var, overridable via /bmode
+        self.curl_mode        = CURL_MODE_DEFAULT  # from env var, overridable via /curl
+        self.curl_trade_count = 0              # curl trades placed today (max CURL_MAX_TRADES)
+        self.flat_mode        = FLAT_MODE_DEFAULT  # from env var, overridable via /flattop
+        self.flat_trade_count = 0              # flat top trades placed today (max FLAT_MAX_TRADES)
         self.cushion_built    = False  # True once 25% of daily target earned
         self.last_trade_time  = None   # datetime of last trade attempt
         self.date             = ""
@@ -1615,6 +2118,9 @@ class State:
         self.force_scan         = False
         self.last_intraday_scan = 0.0
         self.be_moved           = set()
+        # Pattern resets
+        self.curl_trade_count   = 0
+        self.flat_trade_count   = 0
         # Extended hours resets
         self.eh_trade_count     = 0
         self.eh_traded_today    = set()
@@ -1762,6 +2268,32 @@ def handle_cmd(text, cid):
                    if S.b_mode else
                    f"Back to A-quality: gap≥{GAP_MIN}% rvol≥{RVOL_MIN}x "
                    f"float≤{FLOAT_MAX/1e6:.0f}M"))
+
+    elif cmd == "/curl":
+        S.curl_mode = not S.curl_mode
+        st = "ENABLED" if S.curl_mode else "DISABLED"
+        tg_send(f"🌀 *Curl Pattern {st}*\n"
+                + (f"9 EMA pullback detection active\n"
+                   f"Max {CURL_MAX_TRADES} curl trade/day | "
+                   f"EMA touches ≥{CURL_MIN_TOUCHES} | "
+                   f"Surge ≥{CURL_MIN_SURGE_PCT*100:.0f}%\n"
+                   f"Tries curl when bull flag returns nothing"
+                   if S.curl_mode else
+                   "Bull flag only — curl pattern disabled"))
+        log("INFO", f"Curl mode {st}")
+
+    elif cmd == "/flattop":
+        S.flat_mode = not S.flat_mode
+        st = "ENABLED" if S.flat_mode else "DISABLED"
+        tg_send(f"📐 *Flat Top Pattern {st}*\n"
+                + (f"Horizontal resistance breakout detection active\n"
+                   f"Max {FLAT_MAX_TRADES} flat top trade/day | "
+                   f"Min {FLAT_MIN_TOUCHES} resistance taps | "
+                   f"Volume surge ≥{FLAT_BO_VOL_SURGE:.0%}\n"
+                   f"Tries flat top when bull flag + curl return nothing"
+                   if S.flat_mode else
+                   "Flat top pattern disabled"))
+        log("INFO", f"Flat top mode {st}")
         log("INFO", f"B-Mode {st}")
 
     elif cmd == "/extended":
@@ -1819,6 +2351,8 @@ def handle_cmd(text, cid):
             "/stop      — halt all trading\n"
             "/resume    — resume after stop or halt\n"
             "/cancel    — cancel open orders\n"
+            "/curl      — toggle curl/9EMA pullback pattern\n"
+            "/flattop   — toggle flat top breakout pattern\n"
             "/dryrun    — toggle dry-run mode (no real orders)\n"
             "/extended  — toggle extended hours (late session)\n"
             "/orders    — show open orders from Alpaca\n"
@@ -2269,7 +2803,14 @@ def cycle():
 
         def _detect(w):
             pmh = S.premarket_highs.get(w["symbol"])
-            return w, detect_flag(w["symbol"], premarket_high=pmh)
+            sig = detect_flag(w["symbol"], premarket_high=pmh)
+            # Curl fallback: try 9 EMA curl if bull flag found nothing
+            if not sig and S.curl_mode and S.curl_trade_count < CURL_MAX_TRADES:
+                sig = detect_curl(w["symbol"], premarket_high=pmh)
+            # Flat top fallback: try horizontal resistance breakout
+            if not sig and S.flat_mode and S.flat_trade_count < FLAT_MAX_TRADES:
+                sig = detect_flat_top(w["symbol"], premarket_high=pmh)
+            return w, sig
 
         signals = []
         with ThreadPoolExecutor(max_workers=min(5, len(candidates) or 1)) as ex:
@@ -2380,8 +2921,23 @@ def cycle():
             mode_label = "B-MODE" if S.b_mode else "A-QUALITY"
             spread_line = (f"\nSpread: ${ask-bid:.2f} ({(ask-bid)/ask*100:.1f}%)"
                            if bid and ask else "")
+            pat = sig.get("pattern", "bull_flag")
+            if pat == "curl":
+                pattern_emoji, pattern_name = "🌀", "CURL"
+                surge_label, curl_label = "surge", "curl"
+            elif pat == "flat_top":
+                pattern_emoji, pattern_name = "📐", "FLAT TOP"
+                surge_label, curl_label = "push", "consol"
+            else:
+                pattern_emoji, pattern_name = "🚩", "BULL FLAG"
+                surge_label, curl_label = "pole", "flag"
+            ema_line = ""
+            if pat == "curl":
+                ema_line = f"\nEMA touches: {sig.get('ema_touches', 0)}"
+            elif pat == "flat_top":
+                ema_line = f"\nResistance: ${sig.get('resistance', 0):.2f} ({sig.get('resist_touches', 0)} taps)"
             tg_send(
-                f"🚩 *BULL FLAG [{mode_label}]: {sym}*\n"
+                f"{pattern_emoji} *{pattern_name} [{mode_label}]: {sym}*\n"
                 f"Entry:  ${sig['entry']:.2f} (stop-limit, ceil ${round(sig['entry']+MAX_ENTRY_SLIP,2):.2f})\n"
                 f"Stop:   ${sig['stop']:.2f}  (risk ${sig['risk']:.2f}/sh)\n"
                 f"Target: ${sig['target']:.2f}  ({target_type})\n"
@@ -2391,18 +2947,22 @@ def cycle():
                 f"Total risk: ${qty * sig['risk']:.0f}\n"
                 f"─────────────────\n"
                 f"Pattern: {sig['total_candles']} candles "
-                f"(pole {sig['pole_bars']} + flag {sig['flag_bars']})\n"
+                f"({surge_label} {sig['pole_bars']} + {curl_label} {sig['flag_bars']})\n"
                 f"Pullback: {sig['retrace_pct']}% | "
-                f"Flag vol: {sig['flag_vol_ratio']:.0%} of pole\n"
+                f"{curl_label.title()} vol: {sig['flag_vol_ratio']:.0%} of {surge_label}\n"
                 f"VWAP: ${sig['vwap']:.2f} | HOD: ${sig['hod']:.2f} | "
                 f"Float: {float_str}"
-                + spread_line + pmh_line)
+                + ema_line + spread_line + pmh_line)
 
             r = place_bracket(sym, qty, sig["entry"], sig["stop"], sig["target"], ask=live_ask)
 
             if r and r.get("id"):
                 S.traded_today.add(sym)
                 S.trade_count += 1
+                if sig.get("pattern") == "curl":
+                    S.curl_trade_count += 1
+                elif sig.get("pattern") == "flat_top":
+                    S.flat_trade_count += 1
                 S.last_trade_time = now_et()
 
                 S.trades_today.append({
@@ -2417,6 +2977,7 @@ def cycle():
                     "risk":           sig["risk"],
                     "order_id":       r["id"],
                     "size_label":     size_label,
+                    "pattern":        sig.get("pattern", "bull_flag"),
                     "session":        "core",
                     "time":           now_et().strftime("%H:%M ET"),
                     "vwap":           sig["vwap"],
@@ -2578,6 +3139,10 @@ def cycle():
 
                 pmh = S.premarket_highs.get(sym)
                 sig = detect_flag(sym, premarket_high=pmh, session="early")
+                if not sig and S.curl_mode and S.curl_trade_count < CURL_MAX_TRADES:
+                    sig = detect_curl(sym, premarket_high=pmh, session="early")
+                if not sig and S.flat_mode and S.flat_trade_count < FLAT_MAX_TRADES:
+                    sig = detect_flat_top(sym, premarket_high=pmh, session="early")
                 if not sig:
                     continue
 
@@ -2765,6 +3330,10 @@ def cycle():
 
                 pmh = S.premarket_highs.get(sym)
                 sig = detect_flag(sym, premarket_high=pmh, session="late")
+                if not sig and S.curl_mode and S.curl_trade_count < CURL_MAX_TRADES:
+                    sig = detect_curl(sym, premarket_high=pmh, session="late")
+                if not sig and S.flat_mode and S.flat_trade_count < FLAT_MAX_TRADES:
+                    sig = detect_flat_top(sym, premarket_high=pmh, session="late")
                 if not sig:
                     continue
 

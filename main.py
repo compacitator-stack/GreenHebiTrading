@@ -145,10 +145,67 @@ FLAT_MAX_BARS       = 10      # max consolidation length
 FLAT_BO_VOL_SURGE   = 1.50    # breakout candle volume must be >= 150% of consolidation avg
 FLAT_MAX_TRADES     = 1       # max flat top trades per day
 
+# ── VWAP Reclaim Setup ────────────────────────────────────────────────────────
+# Ross's VWAP reclaim: price drops below VWAP → breaks back above → pulls back
+# to retest VWAP → holds → entry on bounce.  State machine:
+#   (1) detect N bars below VWAP  (2) cross above VWAP  (3) pullback to VWAP zone
+#   (4) VWAP holds as support (candle doesn't close below)  (5) entry on next bar
+VWAP_MODE_DEFAULT    = os.environ.get("VWAP_MODE", "").lower() in ("1","true","yes")
+VWAP_ZONE_PCT        = 0.003    # 0.3% — defines "near VWAP" for retest detection
+VWAP_MIN_BELOW_BARS  = 3        # min bars price spent below VWAP before reclaim
+VWAP_HOLD_BARS       = 1        # min bars VWAP must hold as support on retest
+VWAP_BO_VOL_SURGE    = 1.30     # reclaim candle volume vs avg of below-VWAP bars
+VWAP_MAX_TRADES      = 1        # max VWAP reclaim trades per day
+
+# ── Opening Drive Setup (ORB + Gap-and-Go merged) ─────────────────────────────
+# First 5 minutes at open: if premarket high (PMH) is known, entry = break above
+# PMH.  If PMH unavailable, fall back to first-candle-high (classic ORB).
+# Ross: "The first candle to make a new high — that's the moment you're buying"
+DRIVE_MODE_DEFAULT   = os.environ.get("DRIVE_MODE", "").lower() in ("1","true","yes")
+DRIVE_MAX_TRADES     = 1        # max opening drive trades per day
+DRIVE_WINDOW_MINS    = 5        # first N minutes after open to detect the pattern
+DRIVE_BO_VOL_SURGE   = 1.50     # breakout bar volume vs opening range average
+
+# ── Whole / Half-Dollar Overlay ───────────────────────────────────────────────
+# Psychological $0.50 levels as confirmation.  Not standalone — annotates
+# existing signals with level proximity.  Also nudges target up to the next
+# half-dollar level when the calculated target is within LEVEL_NUDGE_PCT below it.
+LEVEL_NUDGE_PCT      = 0.03     # 3% — if target is within 3% below a $0.50 level, extend
+
 # Broad market catalyst detection — bypasses A-quality catalyst gate on
 # macro-driven days (e.g. geopolitical peace deal, Fed surprise, major data).
 # Ross himself trades these: "the catalyst is the market."
 MACRO_CATALYST_GAP_PCT = 1.5  # SPY gap ≥1.5% = broad market catalyst day
+
+# ── Event mode (CPI/FOMC/NFP delay) ─────────────────────────────────────────
+# On known macro event days, delay the core scan window by 15 min to let the
+# post-announcement chaos settle. Ross trades the directional resolution after
+# the initial whipsaw — this captures that exact window.
+EVENT_MODE_ENABLED   = True
+EVENT_DELAY_MINS     = 15      # delay scan/trading N min after scheduled release
+# BLS/Fed scheduled events with approximate release times (ET).
+# Updated quarterly — these rarely change.
+MACRO_EVENTS_2026 = {
+    # CPI releases (8:30 ET, monthly)
+    "2026-01-14": ("CPI",  (8, 30)),  "2026-02-12": ("CPI",  (8, 30)),
+    "2026-03-12": ("CPI",  (8, 30)),  "2026-04-10": ("CPI",  (8, 30)),
+    "2026-05-13": ("CPI",  (8, 30)),  "2026-06-11": ("CPI",  (8, 30)),
+    "2026-07-14": ("CPI",  (8, 30)),  "2026-08-12": ("CPI",  (8, 30)),
+    "2026-09-10": ("CPI",  (8, 30)),  "2026-10-13": ("CPI",  (8, 30)),
+    "2026-11-12": ("CPI",  (8, 30)),  "2026-12-10": ("CPI",  (8, 30)),
+    # NFP / Jobs Report (8:30 ET, first Friday of month)
+    "2026-01-09": ("NFP",  (8, 30)),  "2026-02-06": ("NFP",  (8, 30)),
+    "2026-03-06": ("NFP",  (8, 30)),  "2026-04-03": ("NFP",  (8, 30)),
+    "2026-05-08": ("NFP",  (8, 30)),  "2026-06-05": ("NFP",  (8, 30)),
+    "2026-07-02": ("NFP",  (8, 30)),  "2026-08-07": ("NFP",  (8, 30)),
+    "2026-09-04": ("NFP",  (8, 30)),  "2026-10-02": ("NFP",  (8, 30)),
+    "2026-11-06": ("NFP",  (8, 30)),  "2026-12-04": ("NFP",  (8, 30)),
+    # FOMC decision days (14:00 ET, ~8 per year)
+    "2026-01-29": ("FOMC", (14, 0)),  "2026-03-18": ("FOMC", (14, 0)),
+    "2026-05-06": ("FOMC", (14, 0)),  "2026-06-17": ("FOMC", (14, 0)),
+    "2026-07-29": ("FOMC", (14, 0)),  "2026-09-16": ("FOMC", (14, 0)),
+    "2026-11-04": ("FOMC", (14, 0)),  "2026-12-16": ("FOMC", (14, 0)),
+}
 
 # B-mode (looser criteria, only if no A-quality by 10:00 ET, max 1 trade)
 B_GAP_MIN      = 2.0
@@ -1013,6 +1070,51 @@ def check_catalyst(sym):
         return True, f"{source}: {headline}"
     return False, "No recent news"
 
+# ── Event mode (CPI/FOMC/NFP scan delay) ──────────────────────────────────────
+_event_mode_notified = {"date": ""}
+
+def check_event_mode():
+    """
+    Check if today is a macro event day (CPI, FOMC, NFP).
+    Returns (is_event_day, event_name, release_time_tuple, safe_time_tuple)
+    where safe_time_tuple is the earliest time to begin scanning/trading.
+    """
+    if not EVENT_MODE_ENABLED:
+        return False, None, None, None
+    today = now_et().strftime("%Y-%m-%d")
+    if today not in MACRO_EVENTS_2026:
+        return False, None, None, None
+    name, (hh, mm) = MACRO_EVENTS_2026[today]
+    safe_hh = hh + (mm + EVENT_DELAY_MINS) // 60
+    safe_mm = (mm + EVENT_DELAY_MINS) % 60
+    return True, name, (hh, mm), (safe_hh, safe_mm)
+
+def is_in_event_delay():
+    """
+    Returns True if we're currently in the post-event delay window
+    (between event release and safe_time). Used to gate scan/trading.
+    """
+    is_event, name, release, safe = check_event_mode()
+    if not is_event:
+        return False
+    t = now_et()
+    release_dt = t.replace(hour=release[0], minute=release[1], second=0, microsecond=0)
+    safe_dt    = t.replace(hour=safe[0], minute=safe[1], second=0, microsecond=0)
+    in_delay = release_dt <= t < safe_dt
+    if in_delay:
+        global _event_mode_notified
+        today = t.strftime("%Y-%m-%d")
+        if _event_mode_notified["date"] != today:
+            _event_mode_notified["date"] = today
+            log("INFO", f"EVENT MODE: {name} at {release[0]}:{release[1]:02d} ET — "
+                        f"delaying scan until {safe[0]}:{safe[1]:02d} ET")
+            tg_send(f"📅 *Event Mode — {name} Day*\n"
+                    f"Release: {release[0]}:{release[1]:02d} ET\n"
+                    f"Scan delayed until {safe[0]}:{safe[1]:02d} ET\n"
+                    f"Ross: trade the directional resolution, not the whipsaw")
+    return in_delay
+
+
 # ── Time-of-day RVOL ──────────────────────────────────────────────────────────
 def calc_tod_rvol(today_vol, prev_day_vol, minutes_traded):
     """
@@ -1876,6 +1978,479 @@ def detect_flat_top(sym, premarket_high=None, session="core"):
     return None
 
 
+# ── VWAP Reclaim Detector ─────────────────────────────────────────────────────
+def detect_vwap_reclaim(sym, premarket_high=None, session="core"):
+    """
+    Ross Cameron VWAP Reclaim on 1-minute chart.
+
+    State machine:
+      1. Price spends VWAP_MIN_BELOW_BARS bars below VWAP
+      2. Price crosses above VWAP (reclaim candle)
+      3. Price pulls back to test VWAP zone (within VWAP_ZONE_PCT)
+      4. VWAP holds — candle(s) don't close below VWAP
+      5. Entry on the first candle making a new high after the hold
+
+    Ross (Apr 15): "The VWAP reclaim was phenomenal — my best trade of the day."
+
+    Returns signal dict or None.
+    """
+    bars = get_1min_bars(sym, limit=60)
+    if not bars:
+        log("INFO", f"  [{sym}] SKIP: no 1-min bar data")
+        return None
+
+    today_str = now_et().date().isoformat()
+    bars = [b for b in bars if b["t"][:10] == today_str]
+
+    # Session window (same logic as detect_flag)
+    if session == "early":
+        start_hour, start_min = EH_EARLY_START
+        end_hour, end_min = EH_EARLY_END
+    elif session == "late":
+        start_hour, start_min = 9, 35
+        end_hour, end_min = EH_LATE_END
+    else:
+        # VWAP reclaim needs time to develop — 9:45+ (Ross: "needs time for VWAP to establish")
+        start_hour, start_min = 9, 45
+        end_hour, end_min = 11, 30
+
+    all_today = []
+    market_bars = []
+    vwap_start_hour = start_hour if session == "early" else 9
+    vwap_start_min  = start_min  if session == "early" else 30
+    for b in bars:
+        ts_et = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET)
+        if ts_et.hour > vwap_start_hour or (ts_et.hour == vwap_start_hour and ts_et.minute >= vwap_start_min):
+            all_today.append(b)
+        if ts_et.hour > start_hour or (ts_et.hour == start_hour and ts_et.minute >= start_min):
+            if ts_et.hour < end_hour or (ts_et.hour == end_hour and ts_et.minute <= end_min):
+                market_bars.append(b)
+
+    if len(market_bars) < VWAP_MIN_BELOW_BARS + 3:
+        log("INFO", f"  [{sym}] VWAP SKIP: only {len(market_bars)} bars "
+                    f"(need ≥{VWAP_MIN_BELOW_BARS + 3})")
+        return None
+
+    vwap_all  = calc_vwap(all_today)
+    vwap_dict = {}
+    for i, b in enumerate(all_today):
+        vwap_dict[b["t"]] = vwap_all[i]
+
+    current_vwap  = vwap_dict.get(all_today[-1]["t"], float(market_bars[-1]["c"]))
+    current_price = float(market_bars[-1]["c"])
+    intraday_hod  = max(float(b["h"]) for b in all_today) if all_today else current_price
+
+    # ── State machine scan ────────────────────────────────────────────────
+    # Walk through market_bars looking for the reclaim sequence.
+    best = None
+
+    for i in range(VWAP_MIN_BELOW_BARS + 2, len(market_bars)):
+        bar = market_bars[i]
+        bar_vwap = vwap_dict.get(bar["t"])
+        if not bar_vwap:
+            continue
+
+        bar_close = float(bar["c"])
+        bar_high  = float(bar["h"])
+        bar_low   = float(bar["l"])
+        bar_vol   = float(bar.get("v", 0))
+
+        # Step 1: Look backwards for N bars below VWAP
+        below_count = 0
+        below_vols  = []
+        for j in range(i - 1, max(i - 20, -1), -1):
+            prev = market_bars[j]
+            prev_vwap = vwap_dict.get(prev["t"])
+            if not prev_vwap:
+                break
+            if float(prev["c"]) < prev_vwap:
+                below_count += 1
+                below_vols.append(float(prev.get("v", 0)))
+            else:
+                break  # must be consecutive below-VWAP bars
+        if below_count < VWAP_MIN_BELOW_BARS:
+            continue
+
+        # Step 2: Find the reclaim candle — closes above VWAP after the below stretch.
+        # The reclaim candle is the first bar after below_count that closes above VWAP.
+        # We need bars after the below stretch: check if any bar between the below
+        # stretch end and current bar crossed above.
+        below_end_idx = i - 1 - below_count + 1  # first bar of below streak
+        # Actually, let's restructure: scan for the full sequence ending at bar i.
+        # We want:  [below bars...] [reclaim candle] [optional rise] [retest bar(s)] [breakout = bar i]
+
+        # Find reclaim candle: first bar after below streak closing above VWAP
+        reclaim_idx = None
+        for j in range(i - below_count, i):
+            jbar = market_bars[j]
+            jvwap = vwap_dict.get(jbar["t"])
+            if jvwap and float(jbar["c"]) > jvwap:
+                reclaim_idx = j
+                break
+        if reclaim_idx is None:
+            continue
+
+        reclaim_bar = market_bars[reclaim_idx]
+        reclaim_vwap = vwap_dict.get(reclaim_bar["t"])
+        reclaim_vol  = float(reclaim_bar.get("v", 0))
+
+        # Volume confirmation on reclaim
+        avg_below_vol = sum(below_vols) / len(below_vols) if below_vols else 1
+        if avg_below_vol > 0 and reclaim_vol < avg_below_vol * VWAP_BO_VOL_SURGE:
+            continue  # reclaim candle didn't have enough volume conviction
+
+        # Step 3: Find retest — after reclaim, price pulls back toward VWAP
+        # Look for bars between reclaim and current bar where low touches VWAP zone
+        retest_found = False
+        retest_low   = None
+        hold_count   = 0
+        retest_high  = 0.0
+        for j in range(reclaim_idx + 1, i):
+            jbar  = market_bars[j]
+            jvwap = vwap_dict.get(jbar["t"])
+            if not jvwap:
+                continue
+            jlow   = float(jbar["l"])
+            jclose = float(jbar["c"])
+            jhigh  = float(jbar["h"])
+
+            # Is the low within VWAP zone?
+            if jlow <= jvwap * (1 + VWAP_ZONE_PCT) and jlow >= jvwap * (1 - VWAP_ZONE_PCT):
+                retest_found = True
+                if retest_low is None or jlow < retest_low:
+                    retest_low = jlow
+
+            # Step 4: VWAP holds — close stays above VWAP during retest
+            if retest_found:
+                if jclose >= jvwap:
+                    hold_count += 1
+                else:
+                    # Failed hold — VWAP lost again, reset
+                    retest_found = False
+                    hold_count   = 0
+                    retest_low   = None
+                    continue
+            if jhigh > retest_high:
+                retest_high = jhigh
+
+        if not retest_found or hold_count < VWAP_HOLD_BARS:
+            continue
+
+        # Step 5: Current bar (bar i) = breakout — makes new high above retest range
+        if bar_high <= retest_high:
+            continue  # not a new high
+
+        if bar_close < bar_vwap:
+            continue  # breakout bar must close above VWAP
+
+        # Breakout recency check
+        try:
+            bo_time = datetime.fromisoformat(
+                bar["t"].replace("Z", "+00:00")).astimezone(ET)
+            bo_age_min = (now_et() - bo_time).total_seconds() / 60
+            if bo_age_min > BREAKOUT_MAX_AGE_MIN:
+                log("INFO", f"  [{sym}] VWAP SKIP: breakout {bo_age_min:.0f}min old")
+                continue
+        except Exception:
+            pass
+
+        # ── Trade levels ──────────────────────────────────────────────────
+        entry = round(retest_high + 0.02, 2)   # 2¢ above retest high
+        stop  = round(retest_low  - 0.02, 2) if retest_low else round(bar_vwap - 0.05, 2)
+        risk  = entry - stop
+        if risk < 0.05:
+            continue
+
+        # Target: HOD or measured move (reclaim range = reclaim high to retest low)
+        reclaim_range = float(market_bars[reclaim_idx]["h"]) - (retest_low or float(market_bars[reclaim_idx]["l"]))
+        if intraday_hod > entry:
+            target = round(intraday_hod, 2)
+        else:
+            target = round(entry + max(reclaim_range, risk * 2), 2)
+
+        if premarket_high and premarket_high > target:
+            target = round(premarket_high, 2)
+
+        rr = (target - entry) / risk if risk > 0 else 0
+        if rr < MIN_RR:
+            continue
+
+        breakeven_stop = round(entry + 0.02, 2)
+
+        # Count total pattern bars: below + reclaim-to-breakout
+        pattern_bars = below_count + (i - reclaim_idx + 1)
+
+        candidate = {
+            "symbol":          sym,
+            "entry":           entry,
+            "stop":            stop,
+            "target":          target,
+            "breakeven_stop":  breakeven_stop,
+            "rr":              round(rr, 2),
+            "risk":            round(risk, 2),
+            "pole_height":     round(reclaim_range, 2),
+            "retrace_pct":     round(((retest_high - (retest_low or bar_vwap)) / max(reclaim_range, 0.01)) * 100, 1),
+            "flag_vol_ratio":  round(reclaim_vol / max(avg_below_vol, 1), 2),
+            "vwap":            round(current_vwap, 2),
+            "hod":             round(intraday_hod, 2),
+            "premarket_high":  premarket_high,
+            "pole_bars":       below_count,         # reuse: bars below VWAP
+            "flag_bars":       i - reclaim_idx,      # reuse: reclaim-to-breakout bars
+            "total_candles":   pattern_bars,
+            "target_is_hod":   (target == round(intraday_hod, 2)),
+            "session":         session,
+            "pattern":         "vwap_reclaim",
+            "hold_bars":       hold_count,
+            "reclaim_vol_ratio": round(reclaim_vol / max(avg_below_vol, 1), 2),
+        }
+
+        if best is None or rr > best["rr"]:
+            best = candidate
+
+    if best:
+        s = best
+        hod_label = "HOD retest" if s["target_is_hod"] else "measured move"
+        pmh_line  = (f" | PMH ${s['premarket_high']:.2f}"
+                     if s["premarket_high"] else "")
+        log("INFO",
+            f"  [{sym}] ✅ VWAP RECLAIM | "
+            f"E=${s['entry']} SL=${s['stop']} T=${s['target']} ({hod_label}) "
+            f"RR={s['rr']} | {s['total_candles']} candles "
+            f"(below {s['pole_bars']} + reclaim {s['flag_bars']}) | "
+            f"hold {s['hold_bars']} bars | vol_ratio {s['reclaim_vol_ratio']:.0%} | "
+            f"VWAP ${s['vwap']} HOD ${s['hod']}{pmh_line}")
+        return best
+
+    log("INFO", f"  [{sym}] NO VWAP RECLAIM: no valid reclaim pattern "
+                f"(price ${current_price:.2f} HOD ${intraday_hod:.2f} "
+                f"VWAP ${current_vwap:.2f})")
+    return None
+
+
+# ── Opening Drive Detector (ORB + Gap-and-Go) ────────────────────────────────
+def detect_opening_drive(sym, premarket_high=None, session="core"):
+    """
+    Opening Drive: merges ORB (first candle breakout) with Gap-and-Go (PMH break).
+
+    If premarket high is known → entry = break above PMH (Gap-and-Go, stronger).
+    If PMH unavailable → entry = break above first candle high (classic ORB).
+
+    Ross: "The gap and go is my bread and butter for a reason"
+    Window: first DRIVE_WINDOW_MINS minutes after open only.
+
+    Returns signal dict or None.
+    """
+    bars = get_1min_bars(sym, limit=30)
+    if not bars:
+        log("INFO", f"  [{sym}] SKIP: no 1-min bar data")
+        return None
+
+    today_str = now_et().date().isoformat()
+    bars = [b for b in bars if b["t"][:10] == today_str]
+
+    # This setup only works right at the open: 9:30–9:30+DRIVE_WINDOW_MINS
+    if session != "core":
+        return None  # opening drive is core-only
+
+    all_today = []
+    open_bars = []     # bars in the opening range window (first N min)
+    post_bars = []     # bars after the opening range
+    for b in bars:
+        ts_et = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET)
+        if ts_et.hour > 9 or (ts_et.hour == 9 and ts_et.minute >= 30):
+            all_today.append(b)
+        if ts_et.hour == 9 and 30 <= ts_et.minute < 30 + DRIVE_WINDOW_MINS:
+            open_bars.append(b)
+        elif ts_et.hour > 9 or (ts_et.hour == 9 and ts_et.minute >= 30 + DRIVE_WINDOW_MINS):
+            if ts_et.hour < 10 or (ts_et.hour == 10 and ts_et.minute <= 0):
+                post_bars.append(b)  # only look 30 min past open max
+
+    # Need at least the opening range + 1 breakout bar
+    if len(open_bars) < 1:
+        log("INFO", f"  [{sym}] DRIVE SKIP: no opening bars yet")
+        return None
+
+    # Check current time — this setup must fire in the first ~10 min
+    t = now_et()
+    if t.hour > 9 or (t.hour == 9 and t.minute > 30 + DRIVE_WINDOW_MINS + 5):
+        # Past the drive window — don't detect stale patterns
+        return None
+
+    # VWAP from all today
+    vwap_all = calc_vwap(all_today)
+    current_vwap = vwap_all[-1] if vwap_all else float(all_today[-1]["c"])
+    current_price = float(all_today[-1]["c"])
+    intraday_hod  = max(float(b["h"]) for b in all_today)
+
+    # Opening range stats
+    or_high = max(float(b["h"]) for b in open_bars)
+    or_low  = min(float(b["l"]) for b in open_bars)
+    or_avg_vol = sum(float(b.get("v", 0)) for b in open_bars) / len(open_bars)
+
+    # Determine breakout level: PMH (stronger) or opening range high
+    if premarket_high and premarket_high > or_high:
+        drive_level = premarket_high
+        drive_type  = "gap_go"  # Gap-and-Go: PMH break (higher conviction)
+    else:
+        drive_level = or_high
+        drive_type  = "orb"     # ORB: first candle(s) high
+
+    # Skip if opening range is too wide (risk too high)
+    or_range = or_high - or_low
+    if or_range > 0.50 and or_range / or_high > 0.05:  # >5% opening range = too choppy
+        log("INFO", f"  [{sym}] DRIVE SKIP: opening range too wide "
+                    f"(${or_range:.2f} = {or_range/or_high*100:.1f}%)")
+        return None
+
+    # Look for breakout candle above drive_level in post_bars (or last open bar)
+    check_bars = open_bars[-1:] + post_bars  # last open bar + all post bars
+    breakout_bar = None
+    for b in check_bars:
+        bh = float(b["h"])
+        bc = float(b["c"])
+        bv = float(b.get("v", 0))
+        if bh > drive_level and bc > drive_level:
+            # Volume confirmation
+            if or_avg_vol > 0 and bv >= or_avg_vol * DRIVE_BO_VOL_SURGE:
+                breakout_bar = b
+                break
+            elif or_avg_vol == 0:
+                breakout_bar = b
+                break
+
+    if not breakout_bar:
+        log("INFO", f"  [{sym}] NO DRIVE: no breakout above "
+                    f"{'PMH' if drive_type == 'gap_go' else 'OR high'} "
+                    f"${drive_level:.2f}")
+        return None
+
+    # Breakout recency check
+    try:
+        bo_time = datetime.fromisoformat(
+            breakout_bar["t"].replace("Z", "+00:00")).astimezone(ET)
+        bo_age_min = (now_et() - bo_time).total_seconds() / 60
+        if bo_age_min > BREAKOUT_MAX_AGE_MIN:
+            log("INFO", f"  [{sym}] DRIVE SKIP: breakout {bo_age_min:.0f}min old")
+            return None
+    except Exception:
+        pass
+
+    # ── Trade levels ──────────────────────────────────────────────────────
+    entry = round(drive_level + 0.02, 2)
+    stop  = round(or_low - 0.02, 2)  # stop = low of opening range
+    risk  = entry - stop
+    if risk < 0.05:
+        return None
+
+    # Target: HOD, PMH (if above), or measured move (opening range height)
+    if intraday_hod > entry:
+        target = round(intraday_hod, 2)
+    else:
+        target = round(entry + or_range, 2)  # measured move = OR height
+
+    if premarket_high and premarket_high > target and drive_type == "orb":
+        target = round(premarket_high, 2)
+
+    rr = (target - entry) / risk if risk > 0 else 0
+    if rr < MIN_RR:
+        log("INFO", f"  [{sym}] DRIVE SKIP: R:R {rr:.1f} < {MIN_RR}")
+        return None
+
+    # Price must be above VWAP for long bias
+    if current_price < current_vwap * 0.995:
+        log("INFO", f"  [{sym}] DRIVE SKIP: price ${current_price:.2f} "
+                    f"below VWAP ${current_vwap:.2f}")
+        return None
+
+    breakeven_stop = round(entry + 0.02, 2)
+
+    candidate = {
+        "symbol":          sym,
+        "entry":           entry,
+        "stop":            stop,
+        "target":          target,
+        "breakeven_stop":  breakeven_stop,
+        "rr":              round(rr, 2),
+        "risk":            round(risk, 2),
+        "pole_height":     round(or_range, 2),
+        "retrace_pct":     0.0,  # no retrace in opening drive
+        "flag_vol_ratio":  round(float(breakout_bar.get("v", 0)) / max(or_avg_vol, 1), 2),
+        "vwap":            round(current_vwap, 2),
+        "hod":             round(intraday_hod, 2),
+        "premarket_high":  premarket_high,
+        "pole_bars":       len(open_bars),    # opening range bars
+        "flag_bars":       0,                 # no consolidation phase
+        "total_candles":   len(open_bars) + 1,  # OR bars + breakout
+        "target_is_hod":   (target == round(intraday_hod, 2)),
+        "session":         session,
+        "pattern":         "opening_drive",
+        "drive_type":      drive_type,  # "gap_go" or "orb"
+        "drive_level":     round(drive_level, 2),
+    }
+
+    hod_label = "HOD retest" if candidate["target_is_hod"] else "measured move"
+    dt_label = "GAP & GO (PMH)" if drive_type == "gap_go" else "ORB"
+    pmh_line = (f" | PMH ${premarket_high:.2f}" if premarket_high else "")
+    log("INFO",
+        f"  [{sym}] ✅ {dt_label} | "
+        f"E=${entry} SL=${stop} T=${target} ({hod_label}) "
+        f"RR={candidate['rr']} | OR ${or_low:.2f}–${or_high:.2f} | "
+        f"Breakout level ${drive_level:.2f} | "
+        f"VWAP ${current_vwap:.2f} HOD ${intraday_hod:.2f}{pmh_line}")
+    return candidate
+
+
+# ── Whole / Half-Dollar Level Overlay ─────────────────────────────────────────
+def nearest_half_dollar(price):
+    """Return the nearest $0.50 level at or above price."""
+    return round(math.ceil(price * 2) / 2, 2)
+
+
+def apply_level_overlay(sig):
+    """
+    Annotate a signal dict with psychological level info and optionally
+    nudge target up to the next half-dollar level.
+
+    Modifies sig in-place and returns it.
+    """
+    if not sig:
+        return sig
+
+    entry  = sig["entry"]
+    target = sig["target"]
+
+    # Find nearest half-dollar levels
+    entry_level  = nearest_half_dollar(entry)
+    target_level = nearest_half_dollar(target)
+
+    # Entry near a level? (within $0.05)
+    entry_near = abs(entry - entry_level) <= 0.05 or abs(entry - (entry_level - 0.50)) <= 0.05
+    sig["near_level"] = entry_near
+    if entry_near:
+        lvl = entry_level if abs(entry - entry_level) <= 0.05 else round(entry_level - 0.50, 2)
+        sig["entry_level"] = lvl
+
+    # Target nudge: if target is within LEVEL_NUDGE_PCT below the next $0.50 level,
+    # extend target to that level (increases R:R at a natural resistance/magnet)
+    if target_level > target:
+        gap_pct = (target_level - target) / target if target > 0 else 1
+        if gap_pct <= LEVEL_NUDGE_PCT:
+            old_target = target
+            sig["target"] = target_level
+            sig["target_nudged"] = True
+            sig["target_nudge_from"] = old_target
+            # Recalculate R:R
+            risk = sig["risk"]
+            if risk > 0:
+                sig["rr"] = round((sig["target"] - sig["entry"]) / risk, 2)
+        else:
+            sig["target_nudged"] = False
+    else:
+        sig["target_nudged"] = False
+
+    return sig
+
+
 # ── Scanner ───────────────────────────────────────────────────────────────────
 def scan_premarket(b_mode=False):
     """
@@ -2066,6 +2641,10 @@ class State:
         self.curl_trade_count = 0              # curl trades placed today (max CURL_MAX_TRADES)
         self.flat_mode        = FLAT_MODE_DEFAULT  # from env var, overridable via /flattop
         self.flat_trade_count = 0              # flat top trades placed today (max FLAT_MAX_TRADES)
+        self.vwap_mode        = VWAP_MODE_DEFAULT  # from env var, overridable via /vwap
+        self.vwap_trade_count = 0              # VWAP reclaim trades placed today
+        self.drive_mode       = DRIVE_MODE_DEFAULT  # from env var, overridable via /drive
+        self.drive_trade_count = 0             # opening drive trades placed today
         self.cushion_built    = False  # True once 25% of daily target earned
         self.last_trade_time  = None   # datetime of last trade attempt
         self.date             = ""
@@ -2121,6 +2700,8 @@ class State:
         # Pattern resets
         self.curl_trade_count   = 0
         self.flat_trade_count   = 0
+        self.vwap_trade_count   = 0
+        self.drive_trade_count  = 0
         # Extended hours resets
         self.eh_trade_count     = 0
         self.eh_traded_today    = set()
@@ -2193,6 +2774,11 @@ def handle_cmd(text, cid):
             f"Halted:  {d.get('halted',False)}\n"
             f"Stopped: {d.get('stopped',False)}\n"
             f"Core cold halt: {S.core_cold_halted}\n"
+            f"Patterns: 🚩flag"
+            f" {'🌀curl' if S.curl_mode else ''}"
+            f" {'📐flat' if S.flat_mode else ''}"
+            f" {'📈vwap' if S.vwap_mode else ''}"
+            f" {'🚀drive' if S.drive_mode else ''}\n"
             f"Red streak: {d.get('consecutive_red_days',0)}d"
             + (" — drawdown sizing ACTIVE (0.5×)" if d.get('consecutive_red_days',0) >= 2 else "") + "\n"
             f"Dry-run: {'🔵 ON' if DRY_RUN else '🟢 OFF'}\n"
@@ -2294,7 +2880,32 @@ def handle_cmd(text, cid):
                    if S.flat_mode else
                    "Flat top pattern disabled"))
         log("INFO", f"Flat top mode {st}")
-        log("INFO", f"B-Mode {st}")
+
+    elif cmd == "/vwap":
+        S.vwap_mode = not S.vwap_mode
+        st = "ENABLED" if S.vwap_mode else "DISABLED"
+        tg_send(f"📈 *VWAP Reclaim Pattern {st}*\n"
+                + (f"VWAP reclaim → retest → bounce detection active\n"
+                   f"Max {VWAP_MAX_TRADES} VWAP trade/day | "
+                   f"Min {VWAP_MIN_BELOW_BARS} bars below VWAP | "
+                   f"Hold ≥{VWAP_HOLD_BARS} bars\n"
+                   f"Priority: after bull flag, before flat top"
+                   if S.vwap_mode else
+                   "VWAP reclaim pattern disabled"))
+        log("INFO", f"VWAP reclaim mode {st}")
+
+    elif cmd == "/drive":
+        S.drive_mode = not S.drive_mode
+        st = "ENABLED" if S.drive_mode else "DISABLED"
+        tg_send(f"🚀 *Opening Drive Pattern {st}*\n"
+                + (f"ORB + Gap-and-Go merged detection active\n"
+                   f"Max {DRIVE_MAX_TRADES} drive trade/day | "
+                   f"Window: first {DRIVE_WINDOW_MINS}min after open | "
+                   f"Uses PMH when available (Gap-and-Go)\n"
+                   f"Priority: last (lowest conviction)"
+                   if S.drive_mode else
+                   "Opening drive pattern disabled"))
+        log("INFO", f"Opening drive mode {st}")
 
     elif cmd == "/extended":
         # Toggle extended hours mode at runtime
@@ -2353,12 +2964,15 @@ def handle_cmd(text, cid):
             "/cancel    — cancel open orders\n"
             "/curl      — toggle curl/9EMA pullback pattern\n"
             "/flattop   — toggle flat top breakout pattern\n"
+            "/vwap      — toggle VWAP reclaim pattern\n"
+            "/drive     — toggle opening drive (ORB+Gap&Go)\n"
             "/dryrun    — toggle dry-run mode (no real orders)\n"
             "/extended  — toggle extended hours (late session)\n"
             "/orders    — show open orders from Alpaca\n"
             "/report    — daily summary (trades + watchlist)\n"
             "/bmode     — toggle B-mode (looser criteria)\n"
             "/wsstatus  — Alpaca WebSocket + bar cache state\n"
+            "/eventmode — check if today is a macro event day\n"
             "/help      — this message\n\n"
             f"*A-quality*: gap≥{GAP_MIN}% rvol≥{RVOL_MIN}x "
             f"float≤{FLOAT_MAX/1e6:.0f}M ${PRICE_LO}-${PRICE_HI}\n"
@@ -2465,6 +3079,18 @@ def handle_cmd(text, cid):
             f"REST fallback active if WS disconnects."
         )
 
+    elif cmd == "/eventmode":
+        is_event, name, release, safe = check_event_mode()
+        if is_event:
+            in_delay = is_in_event_delay()
+            tg_send(f"📅 *Event Mode — {name} Day*\n"
+                    f"Release: {release[0]}:{release[1]:02d} ET\n"
+                    f"Safe to trade: {safe[0]}:{safe[1]:02d} ET\n"
+                    f"Status: {'⏳ DELAYING' if in_delay else '✅ Clear to trade'}")
+        else:
+            tg_send("📅 No macro event scheduled today.\n"
+                    "Normal scan/trading schedule active.")
+
     else:
         log("DEBUG", f"Unknown command: {cmd}")
 
@@ -2549,10 +3175,17 @@ def cycle():
                     f"equity ${S.equity:,.2f}")
         S.last_heartbeat = now_ts
 
+    # ── Event mode delay check ─────────────────────────────────────────────
+    # On CPI/FOMC/NFP days, delay scanning until after the initial whipsaw.
+    event_delay_active = is_in_event_delay()
+
     # ── Core scan at 9:15 ET (or forced) ────────────────────────────────────
     # Merges new candidates into existing watchlist (premarket scan may have
     # already built one). Never overwrites — only adds new symbols.
+    # On event days, delay the scan until after the event release + delay period.
     scan_time = is_wd and hh == 9 and mm >= 15 and mm < 20
+    if event_delay_active and not S.force_scan:
+        scan_time = False  # defer to post-event intraday scan
     if (scan_time and not S.scanned) or S.force_scan:
         is_forced = S.force_scan   # remember if this was a manual /scan
         fresh = scan_premarket(b_mode=S.b_mode)
@@ -2645,7 +3278,7 @@ def cycle():
     # ── Intraday re-scan every INTRADAY_SCAN_MINS during trading window ───────
     # Catches stocks that emerge mid-session (e.g. ELAB/ASTC found at 10:40 ET
     # today despite zero candidates at 9:15 ET pre-market scan)
-    in_trading_window = (is_wd and
+    in_trading_window = (is_wd and not event_delay_active and
                          ((hh == 9 and mm >= 35) or hh == 10
                           or (hh == 11 and mm == 0)))
     if (in_trading_window
@@ -2744,7 +3377,8 @@ def cycle():
                 S.save()
 
     # ── Active trading: 9:35–11:00 ET ────────────────────────────────────────
-    in_window = (is_wd and
+    # On event days, trading is also gated by event_delay_active (set above).
+    in_window = (is_wd and not event_delay_active and
                  ((hh == 9 and mm >= 35) or hh == 10
                   or (hh == 11 and mm == 0)))
 
@@ -2803,13 +3437,24 @@ def cycle():
 
         def _detect(w):
             pmh = S.premarket_highs.get(w["symbol"])
+            # Priority chain — highest conviction first:
+            # 1. Bull flag (battle-tested, highest hit rate)
             sig = detect_flag(w["symbol"], premarket_high=pmh)
-            # Curl fallback: try 9 EMA curl if bull flag found nothing
-            if not sig and S.curl_mode and S.curl_trade_count < CURL_MAX_TRADES:
-                sig = detect_curl(w["symbol"], premarket_high=pmh)
-            # Flat top fallback: try horizontal resistance breakout
+            # 2. VWAP reclaim (Ross's best trade type)
+            if not sig and S.vwap_mode and S.vwap_trade_count < VWAP_MAX_TRADES:
+                sig = detect_vwap_reclaim(w["symbol"], premarket_high=pmh)
+            # 3. Flat top breakout
             if not sig and S.flat_mode and S.flat_trade_count < FLAT_MAX_TRADES:
                 sig = detect_flat_top(w["symbol"], premarket_high=pmh)
+            # 4. Curl / 9 EMA pullback
+            if not sig and S.curl_mode and S.curl_trade_count < CURL_MAX_TRADES:
+                sig = detect_curl(w["symbol"], premarket_high=pmh)
+            # 5. Opening drive (ORB / Gap-and-Go — first minutes only)
+            if not sig and S.drive_mode and S.drive_trade_count < DRIVE_MAX_TRADES:
+                sig = detect_opening_drive(w["symbol"], premarket_high=pmh)
+            # Apply whole/half-dollar overlay (target nudge + level annotation)
+            if sig:
+                sig = apply_level_overlay(sig)
             return w, sig
 
         signals = []
@@ -2928,6 +3573,14 @@ def cycle():
             elif pat == "flat_top":
                 pattern_emoji, pattern_name = "📐", "FLAT TOP"
                 surge_label, curl_label = "push", "consol"
+            elif pat == "vwap_reclaim":
+                pattern_emoji, pattern_name = "📈", "VWAP RECLAIM"
+                surge_label, curl_label = "below", "reclaim"
+            elif pat == "opening_drive":
+                dt = sig.get("drive_type", "orb")
+                pattern_emoji = "🚀" if dt == "gap_go" else "🔔"
+                pattern_name = "GAP & GO" if dt == "gap_go" else "ORB"
+                surge_label, curl_label = "OR", "breakout"
             else:
                 pattern_emoji, pattern_name = "🚩", "BULL FLAG"
                 surge_label, curl_label = "pole", "flag"
@@ -2936,6 +3589,15 @@ def cycle():
                 ema_line = f"\nEMA touches: {sig.get('ema_touches', 0)}"
             elif pat == "flat_top":
                 ema_line = f"\nResistance: ${sig.get('resistance', 0):.2f} ({sig.get('resist_touches', 0)} taps)"
+            elif pat == "vwap_reclaim":
+                ema_line = f"\nVWAP hold: {sig.get('hold_bars', 0)} bars | Vol ratio: {sig.get('reclaim_vol_ratio', 0):.0%}"
+            elif pat == "opening_drive":
+                ema_line = f"\nDrive level: ${sig.get('drive_level', 0):.2f} ({'PMH' if sig.get('drive_type') == 'gap_go' else '1st candle'})"
+            # Half-dollar overlay annotation
+            if sig.get("near_level"):
+                ema_line += f"\n💰 Near ${sig.get('entry_level', 0):.2f} level"
+            if sig.get("target_nudged"):
+                ema_line += f"\n🎯 Target nudged ${sig.get('target_nudge_from', 0):.2f}→${sig['target']:.2f} (half-dollar)"
             tg_send(
                 f"{pattern_emoji} *{pattern_name} [{mode_label}]: {sym}*\n"
                 f"Entry:  ${sig['entry']:.2f} (stop-limit, ceil ${round(sig['entry']+MAX_ENTRY_SLIP,2):.2f})\n"
@@ -2963,6 +3625,10 @@ def cycle():
                     S.curl_trade_count += 1
                 elif sig.get("pattern") == "flat_top":
                     S.flat_trade_count += 1
+                elif sig.get("pattern") == "vwap_reclaim":
+                    S.vwap_trade_count += 1
+                elif sig.get("pattern") == "opening_drive":
+                    S.drive_trade_count += 1
                 S.last_trade_time = now_et()
 
                 S.trades_today.append({

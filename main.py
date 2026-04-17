@@ -345,6 +345,46 @@ def get_live_pnl():
         log("DEBUG", f"Live P&L fetch failed: {e}")
         return None, None
 
+def update_internal_pnl():
+    """C1: Compute GreenHebi-internal P&L from today's Alpaca fills.
+    Only counts fills for symbols in S.traded_today (ignores other bots)."""
+    try:
+        today = now_et().strftime("%Y-%m-%d")
+        fills = alp_get(f"/v2/account/activities/FILL?date={today}&direction=desc&page_size=200")
+        if not fills:
+            return
+        gh_syms = S.traded_today | S.eh_traded_today
+        if not gh_syms:
+            return
+        pnl = 0.0
+        buys = {}   # sym -> list of (qty, price)
+        sells = {}  # sym -> list of (qty, price)
+        for f in fills:
+            sym = f.get("symbol", "")
+            if sym not in gh_syms:
+                continue
+            side = f.get("side", "")
+            qty = abs(float(f.get("qty", 0)))
+            px = float(f.get("price", 0))
+            if side == "buy":
+                buys.setdefault(sym, []).append((qty, px))
+            elif side in ("sell", "sell_short"):
+                sells.setdefault(sym, []).append((qty, px))
+        for sym in gh_syms:
+            buy_cost = sum(q * p for q, p in buys.get(sym, []))
+            buy_qty = sum(q for q, p in buys.get(sym, []))
+            sell_rev = sum(q * p for q, p in sells.get(sym, []))
+            sell_qty = sum(q for q, p in sells.get(sym, []))
+            # Only count P&L for closed round-trips
+            closed_qty = min(buy_qty, sell_qty)
+            if closed_qty > 0 and buy_qty > 0 and sell_qty > 0:
+                avg_buy = buy_cost / buy_qty
+                avg_sell = sell_rev / sell_qty
+                pnl += (avg_sell - avg_buy) * closed_qty
+        S.internal_pnl = round(pnl, 2)
+    except Exception as e:
+        log("DEBUG", f"Internal P&L calc failed: {e}")
+
 def manage_breakeven_stops(trades_today, be_moved_set):
     """
     Autonomous breakeven stop management.
@@ -382,8 +422,24 @@ def manage_breakeven_stops(trades_today, be_moved_set):
                 continue
 
             parent_status = full.get("status", "")
-            if parent_status != "filled":
+
+            # M8: Detect expired/cancelled orders and free the trade slot
+            if parent_status in ("canceled", "cancelled", "expired", "rejected"):
+                log("INFO", f"  [{tr['symbol']}] Order {parent_status} — freeing trade slot")
+                if S.trade_count > 0:
+                    S.trade_count -= 1
+                S.traded_today.discard(tr['symbol'])
+                be_moved_set.add(order_id)
+                continue
+
+            if parent_status not in ("filled", "partially_filled"):
                 continue  # buy not yet filled — nothing to move
+
+            # C2: Check actual filled qty — bracket legs may reference original qty
+            filled_qty = int(float(full.get("filled_qty", tr.get("qty", 0))))
+            if parent_status == "partially_filled":
+                log("WARN", f"  [{tr['symbol']}] Partial fill: {filled_qty}/{tr.get('qty')} shares")
+                tg_send(f"⚠️ *{tr['symbol']}* partial fill: {filled_qty}/{tr.get('qty')} shares")
 
             # Find the stop-loss child leg
             legs = full.get("legs", [])
@@ -431,18 +487,28 @@ def manage_breakeven_stops(trades_today, be_moved_set):
                         f"(was ${current_stop:.2f})")
                 newly_moved.add(order_id)
             else:
-                log("WARN", f"  [{tr['symbol']}] BE stop PATCH failed: {result}")
-                tg_send(f"⚠️ {tr['symbol']} breakeven stop move failed\n"
-                        f"Tried: ${current_stop:.2f} -> ${be_price:.2f}\n"
-                        f"Check Alpaca dashboard")
-                # Don't add to be_moved_set — will retry next cycle
+                # M5: Track retry count and escalate after 5 failures
+                retry_key = f"_be_retries_{order_id}"
+                retries = getattr(S, retry_key, 0) + 1
+                setattr(S, retry_key, retries)
+                if retries >= 5:
+                    log("ERROR", f"  [{tr['symbol']}] BE stop PATCH failed {retries}x — giving up")
+                    tg_send(f"🚨 *{tr['symbol']}* breakeven stop failed {retries}x\n"
+                            f"⚠️ STOP IS STILL AT ${current_stop:.2f}\n"
+                            f"Check Alpaca dashboard immediately!")
+                    be_moved_set.add(order_id)  # stop retrying
+                else:
+                    log("WARN", f"  [{tr['symbol']}] BE stop PATCH failed ({retries}/5): {result}")
+                    tg_send(f"⚠️ {tr['symbol']} breakeven stop move failed ({retries}/5)\n"
+                            f"Tried: ${current_stop:.2f} -> ${be_price:.2f}\n"
+                            f"Will retry next cycle")
 
         except Exception as e:
             log("ERROR", f"  [{tr.get('symbol','?')}] BE stop error: {e}")
 
     return newly_moved
 
-def get_1min_bars(sym, limit=60):
+def get_1min_bars(sym, limit=180):
     """
     Fetch 1-min bars. Uses Alpaca WebSocket cache when available
     (seeded on subscribe + updated in real-time). Falls back to
@@ -463,7 +529,7 @@ def get_1min_bars(sym, limit=60):
     # Polygon REST fallback — full SIP coverage including OTC/micro-caps
     today = now_et().date().isoformat()
     url2 = (f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/minute/"
-            f"{today}/{today}?adjusted=false&sort=asc&limit=120"
+            f"{today}/{today}?adjusted=false&sort=asc&limit=400"
             f"&apiKey={POLYGON_KEY}")
     resp2 = GET(url2)
     if resp2 and resp2.get("results"):
@@ -641,7 +707,7 @@ def ws_subscribe(symbols):
         else:
             today = now_et().date().isoformat()
             url2 = (f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/minute/"
-                    f"{today}/{today}?adjusted=false&sort=asc&limit=120"
+                    f"{today}/{today}?adjusted=false&sort=asc&limit=400"
                     f"&apiKey={POLYGON_KEY}")
             resp2 = GET(url2)
             if resp2 and resp2.get("results"):
@@ -920,6 +986,15 @@ def monitor_eh_stops():
                     del S.eh_active_stops[order_id]
                     continue
 
+                # C4: Verify position still exists before selling
+                # (TP may have filled between last check and stop trigger)
+                actual_pos = alp_get(f"/v2/positions/{sym}")
+                if not actual_pos or not actual_pos.get("qty"):
+                    log("INFO", f"  [{sym}] EH stop triggered but position already closed (TP filled?)")
+                    del S.eh_active_stops[order_id]
+                    continue
+                actual_qty = abs(int(float(actual_pos.get("qty", info["qty"]))))
+
                 # Cancel TP order first
                 if info.get("tp_order_id"):
                     alp_del(f"/v2/orders/{info['tp_order_id']}")
@@ -927,7 +1002,7 @@ def monitor_eh_stops():
 
                 # Submit aggressive limit sell (price - 5¢ to ensure fill)
                 stop_sell = alp_post("/v2/orders", {
-                    "symbol": sym, "qty": str(info["qty"]), "side": "sell",
+                    "symbol": sym, "qty": str(actual_qty), "side": "sell",
                     "type": "limit", "time_in_force": "day",
                     "limit_price": str(round(current_price - 0.05, 2)),
                     "extended_hours": True,
@@ -1270,7 +1345,7 @@ def detect_flag(sym, premarket_high=None, session="core"):
 
     Returns signal dict or None. Logs reason for every rejection.
     """
-    bars = get_1min_bars(sym, limit=60)
+    bars = get_1min_bars(sym, limit=180)
     if not bars:
         log("INFO", f"  [{sym}] SKIP: no 1-min bar data")
         return None
@@ -1531,7 +1606,7 @@ def detect_curl(sym, premarket_high=None, session="core"):
 
     Same signal dict contract as detect_flag(). Max 1 curl trade/day.
     """
-    bars = get_1min_bars(sym, limit=60)
+    bars = get_1min_bars(sym, limit=180)
     if not bars:
         log("INFO", f"  [{sym}] CURL SKIP: no 1-min bar data")
         return None
@@ -1768,7 +1843,7 @@ def detect_flat_top(sym, premarket_high=None, session="core"):
 
     Same signal dict contract as detect_flag(). Max 1 flat top trade/day.
     """
-    bars = get_1min_bars(sym, limit=60)
+    bars = get_1min_bars(sym, limit=180)
     if not bars:
         log("INFO", f"  [{sym}] FLAT SKIP: no 1-min bar data")
         return None
@@ -1994,7 +2069,7 @@ def detect_vwap_reclaim(sym, premarket_high=None, session="core"):
 
     Returns signal dict or None.
     """
-    bars = get_1min_bars(sym, limit=60)
+    bars = get_1min_bars(sym, limit=180)
     if not bars:
         log("INFO", f"  [{sym}] SKIP: no 1-min bar data")
         return None
@@ -2646,6 +2721,7 @@ class State:
         self.drive_mode       = DRIVE_MODE_DEFAULT  # from env var, overridable via /drive
         self.drive_trade_count = 0             # opening drive trades placed today
         self.cushion_built    = False  # True once 25% of daily target earned
+        self.internal_pnl     = 0.0   # C1: GreenHebi-only P&L from own fills
         self.last_trade_time  = None   # datetime of last trade attempt
         self.date             = ""
         self.equity           = 0.0
@@ -2686,6 +2762,7 @@ class State:
         self.trades_today    = []
         self.trade_count     = 0
         self.pnl             = 0.0
+        self.internal_pnl    = 0.0
         self.scanned         = False
         self.halted          = False
         self.stopped         = False   # reset cold-market / manual stop
@@ -3140,6 +3217,24 @@ def startup():
     except Exception:
         pass
 
+    # C3: Check for orphaned positions not tracked by GreenHebi
+    try:
+        existing_pos = get_positions()
+        if existing_pos:
+            orphan_syms = [p.get("symbol", "?") for p in existing_pos]
+            orphan_qty = sum(abs(int(float(p.get("qty", 0)))) for p in existing_pos)
+            log("WARN", f"ORPHANED POSITIONS on startup: {orphan_syms} ({orphan_qty} total shares)")
+            tg_send(f"⚠️ *Positions detected on startup*\n"
+                    f"Symbols: {', '.join(orphan_syms)}\n"
+                    f"Total shares: {orphan_qty}\n"
+                    f"Adding to traded_today to prevent duplicate orders.")
+            for p in existing_pos:
+                sym = p.get("symbol", "")
+                if sym:
+                    S.traded_today.add(sym)
+    except Exception as e:
+        log("DEBUG", f"Orphan position check failed: {e}")
+
     tg_send(
         f"🟢 *GreenClaw v3 Started*\n"
         f"Equity: ${S.equity:,.2f}\n"
@@ -3391,14 +3486,16 @@ def cycle():
         if live_pnl is not None:
             S.pnl    = live_pnl
             S.equity = live_eq
+        update_internal_pnl()
 
-        # Daily loss limit check
-        if S.pnl <= MAX_LOSS:
+        # C1: Daily loss limit check uses GreenHebi-internal P&L when available
+        effective_pnl = S.internal_pnl if S.internal_pnl != 0.0 else S.pnl
+        if effective_pnl <= MAX_LOSS:
             S.halted = True
             tg_send(f"🛑 *DAILY LOSS LIMIT HIT*\n"
-                    f"P&L: ${S.pnl:+.2f} | Limit: ${MAX_LOSS:.0f}\n"
+                    f"GreenHebi P&L: ${effective_pnl:+.2f} | Limit: ${MAX_LOSS:.0f}\n"
                     f"Trading halted. Send /resume to override.")
-            log("WARN", f"Loss limit hit: ${S.pnl:.2f}")
+            log("WARN", f"Loss limit hit: ${effective_pnl:.2f} (internal)")
             S.save()
             return
 
@@ -4164,6 +4261,34 @@ def cycle():
     # any already-open positions until they're closed.
     if S.eh_active_stops:
         monitor_eh_stops()
+
+    # ── M7: Core bracket EOD flatten at 15:55 ET ────────────────────────────
+    # Check for any positions from core bracket trades still held. If TP/SL
+    # didn't trigger, flatten before close to avoid unmanaged overnight holds.
+    if (is_wd and hh == 15 and mm >= 55 and mm < 59
+            and S.traded_today and not S.eh_active_stops):
+        try:
+            open_positions = get_positions()
+            if open_positions:
+                gh_held = [p for p in open_positions
+                           if p.get("symbol", "") in S.traded_today]
+                for p in gh_held:
+                    sym = p.get("symbol", "")
+                    qty = abs(int(float(p.get("qty", 0))))
+                    if qty > 0 and not DRY_RUN:
+                        log("WARN", f"  [{sym}] Core EOD flatten: {qty}sh still held at 15:55")
+                        sell_r = alp_post("/v2/orders", {
+                            "symbol": sym, "qty": str(qty), "side": "sell",
+                            "type": "market", "time_in_force": "day",
+                        })
+                        if sell_r and sell_r.get("id"):
+                            log("INFO", f"  [{sym}] Core EOD flatten: market sell submitted")
+                            tg_send(f"🕐 *Core EOD flatten: {sym}* — selling {qty}sh at market")
+                        else:
+                            log("ERROR", f"  [{sym}] Core EOD flatten FAILED: {sell_r}")
+                            tg_send(f"❌ *{sym}* Core EOD flatten failed — check Alpaca dashboard")
+        except Exception as e:
+            log("ERROR", f"Core EOD flatten error: {e}")
 
     # ── Extended Hours: EOD forced liquidation at 15:55 ET ────────────────────
     # Safety net: if any EH positions are still open at 3:55 PM, force-close
